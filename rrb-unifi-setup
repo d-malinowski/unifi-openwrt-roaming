@@ -1,0 +1,536 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 d-malinowski
+#
+# rrb-unifi-setup: install rrb-unifi on an OpenWrt AP, read the 802.11r
+# settings from the UniFi AP(s), verify that both sides match, and configure
+# OpenWrt from the UniFi values. UniFi is the source of truth; nothing on the
+# UniFi AP is changed (it is only read, over SSH, once per AP).
+#
+#   rrb-unifi-setup install            packages, translator files, veth pair
+#   rrb-unifi-setup collect USER@HOST  read the UniFi AP (asks for its SSH password)
+#   rrb-unifi-setup verify [--ssid S]  compare both sides, show what is wrong
+#   rrb-unifi-setup apply  [--ssid S] [--yes]   fix OpenWrt from the UniFi values
+#   rrb-unifi-setup uninstall [--remove-packages] [--yes]
+#   rrb-unifi-setup confirm            keep a network change (see install)
+#
+# Secrets: collected data (it contains the FT key) stays in RAM
+# (/tmp/rrb-unifi-setup, mode 600). Only a SHA-256 of the Wi-Fi password is
+# read from the UniFi AP, never the password itself. Keys are never printed.
+
+VERSION=1.1
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SRC_DIR=$(dirname "$SELF")
+STATE=/etc/rrb-unifi-setup		# backups, original values (persistent)
+DATA=/tmp/rrb-unifi-setup		# collected UniFi data (RAM)
+CONFIRM=/tmp/rrb-unifi-setup.confirmed
+WATCHDOG=120				# s to confirm a network change
+PKGS="ucode-mod-socket kmod-veth"
+
+YES=0; SSID=""; RMPKG=0; ARGS=""
+CMD=$1; [ $# -gt 0 ] && shift
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--yes|-y) YES=1 ;;
+	--ssid) SSID=$2; shift ;;
+	--remove-packages) RMPKG=1 ;;
+	*) ARGS="$ARGS $1" ;;
+	esac
+	shift
+done
+
+say() { echo "$*"; }
+die() { echo "ERROR: $*" >&2; exit 2; }
+fp() { [ -n "$1" ] && echo "$(echo "$1" | cut -c1-4)..." || echo "-"; }	# key fingerprint
+nocolon() { echo "$1" | tr -d ':' | tr 'A-F' 'a-f'; }
+lower() { echo "$1" | tr 'A-F' 'a-f'; }
+sha() { printf %s "$1" | sha256sum | cut -d' ' -f1; }
+
+ft_if() { uci -q get rrb-unifi.main.ft_iface || echo vft0; }
+peer_if() { uci -q get rrb-unifi.main.peer_iface || echo vft1; }
+
+ask() {		# ask "question" -> 0 if yes
+	[ "$YES" = 1 ] && return 0
+	printf '%s [y/N] ' "$1"
+	read -r a
+	[ "$a" = y ] || [ "$a" = Y ]
+}
+
+# ---------------------------------------------------------------- packages
+
+has_apk() { command -v apk >/dev/null 2>&1; }
+
+pkg_installed() {
+	if has_apk; then apk info -e "$1" >/dev/null 2>&1
+	else opkg status "$1" 2>/dev/null | grep -q '^Status:.* installed'; fi
+}
+
+pkg_install() {
+	if has_apk; then apk update && apk add "$@"
+	else opkg update && opkg install "$@"; fi
+}
+
+pkg_remove() {
+	if has_apk; then apk del "$@"
+	else opkg remove "$@"; fi
+}
+
+# ---------------------------------------------------------------- network change with watchdog
+
+# Apply a network config change and reload; if it isn't confirmed within
+# $WATCHDOG seconds (SSH broken?), restore the backup and reload again.
+net_reload_guarded() {	# net_reload_guarded BACKUP_FILE
+	rm -f "$CONFIRM"
+	setsid sh -c "sleep $WATCHDOG; [ -e '$CONFIRM' ] && exit 0; \
+		logger -t rrb-unifi-setup 'network change not confirmed: restoring $1'; \
+		cp '$1' /etc/config/network && /etc/init.d/network reload" \
+		</dev/null >/dev/null 2>&1 &
+	/etc/init.d/network reload
+	if [ "$YES" = 1 ]; then
+		say "Network reloaded. Confirm within ${WATCHDOG}s from a NEW SSH session:"
+		say "  rrb-unifi-setup confirm"
+		say "otherwise the previous network config is restored automatically."
+		return 0
+	fi
+	say "Network reloaded. If you can read this, press Enter within ${WATCHDOG}s to keep it"
+	say "(otherwise the previous network config is restored automatically)."
+	if read -r -t "$WATCHDOG" _; then
+		touch "$CONFIRM"
+		say "Network change kept."
+	fi
+}
+
+backup_dir() {
+	d=$STATE/backup-$(date +%Y%m%d-%H%M%S)
+	mkdir -p "$d" && chmod 700 "$STATE" "$d"
+	echo "$d"
+}
+
+# ---------------------------------------------------------------- install
+
+cmd_install() {
+	say "== rrb-unifi-setup $VERSION: install"
+	grep -q "OpenWrt" /etc/openwrt_release 2>/dev/null || die "not OpenWrt"
+	. /etc/openwrt_release
+	say "OpenWrt: $DISTRIB_DESCRIPTION"
+	ls /usr/sbin/hostapd /usr/sbin/wpad >/dev/null 2>&1 || die "no hostapd/wpad installed"
+	for f in rrb-unifi.uc rrb-unifi.init rrb-unifi.config; do
+		[ -f "$SRC_DIR/$f" ] || die "$f not found next to this script ($SRC_DIR)"
+	done
+
+	need=""
+	for p in $PKGS; do pkg_installed "$p" || need="$need $p"; done
+	if [ -n "$need" ]; then
+		say "Installing packages:$need"
+		ask "Install now (needs internet)?" || die "cancelled"
+		pkg_install $need || die "package install failed"
+		mkdir -p "$STATE"; for p in $need; do echo "$p" >> "$STATE/installed-packages"; done
+	else
+		say "Packages: $PKGS already installed"
+	fi
+	[ "$(ucode -l socket -e 'print(socket.AF_PACKET)' 2>/dev/null)" = 17 ] || die "ucode socket module not working"
+
+	cp "$SRC_DIR/rrb-unifi.uc" /usr/sbin/rrb-unifi.uc
+	cp "$SRC_DIR/rrb-unifi.init" /etc/init.d/rrb-unifi
+	[ -f /etc/config/rrb-unifi ] || cp "$SRC_DIR/rrb-unifi.config" /etc/config/rrb-unifi
+	[ "$SELF" = /usr/sbin/rrb-unifi-setup ] || cp "$SELF" /usr/sbin/rrb-unifi-setup
+	chmod +x /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi /usr/sbin/rrb-unifi-setup
+	/etc/init.d/rrb-unifi enable
+	for f in /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi /etc/rc.d/S99rrb-unifi /usr/sbin/rrb-unifi-setup; do
+		grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+	done
+	say "Files installed, service enabled (starts after 'apply')"
+
+	ft=$(ft_if); peer=$(peer_if)
+	if [ -e "/sys/class/net/$ft" ] && [ -e "/sys/class/net/$peer" ]; then
+		say "veth $ft/$peer: present"
+	else
+		if uci -q get network.vft >/dev/null; then
+			# configured, but not created (e.g. kmod-veth was missing after a
+			# firmware upgrade): reload the network to create it
+			[ "$(uci -q get network.vft.name)" = "$ft" ] && [ "$(uci -q get network.vft.peer_name)" = "$peer" ] 				|| die "network.vft does not match $ft/$peer; check /etc/config/network"
+			say "veth $ft/$peer is configured but missing; reloading the network to create it"
+			ask "Reload the network?" || die "cancelled"
+			b=$(backup_dir); cp /etc/config/network "$b/network"
+			net_reload_guarded "$b/network"
+			n=0; while [ $n -lt 20 ] && ! [ -e "/sys/class/net/$peer" ]; do sleep 1; n=$((n + 1)); done
+			[ -e "/sys/class/net/$ft" ] && [ -e "/sys/class/net/$peer" ] || die "veth did not come up"
+			say "veth $ft/$peer: up"
+			say "Next: rrb-unifi-setup verify (hostapd may need a Wi-Fi restart now that $ft exists)"
+			return 0
+		fi
+		for i in $ft $peer; do [ -e "/sys/class/net/$i" ] && die "$i exists but is not ours; set other names in /etc/config/rrb-unifi"; done
+		say "Creating veth $ft/$peer (network sections vft, ftlink, ftpeer)"
+		ask "Change /etc/config/network and reload the network?" || die "cancelled"
+		b=$(backup_dir); cp /etc/config/network "$b/network"
+		uci batch <<-EOF
+		set network.vft=device
+		set network.vft.type='veth'
+		set network.vft.name='$ft'
+		set network.vft.peer_name='$peer'
+		set network.ftlink=interface
+		set network.ftlink.proto='none'
+		set network.ftlink.device='$ft'
+		set network.ftpeer=interface
+		set network.ftpeer.proto='none'
+		set network.ftpeer.device='$peer'
+		EOF
+		uci commit network
+		net_reload_guarded "$b/network"
+		n=0; while [ $n -lt 20 ] && ! [ -e "/sys/class/net/$peer" ]; do sleep 1; n=$((n + 1)); done
+		[ -e "/sys/class/net/$ft" ] && [ -e "/sys/class/net/$peer" ] || die "veth did not come up"
+		say "veth $ft/$peer: up"
+	fi
+	say "Next: rrb-unifi-setup collect USER@UNIFI_IP"
+}
+
+# ---------------------------------------------------------------- collect (UniFi side, read-only)
+
+# Runs on the UniFi AP. Read-only. Prints the FT-enabled BSSes; for the
+# Wi-Fi password only its SHA-256.
+REMOTE='
+echo "host_name=$(uname -n)"
+echo "fw=$(cat /etc/version 2>/dev/null)"
+for f in /etc/hostapd/*.cfg; do
+  grep -q "^wpa_key_mgmt=.*FT-" "$f" || continue
+  ifn=$(sed -n "s/^interface=//p" "$f")
+  echo "begin $f"
+  echo "addr=$(cat /sys/class/net/$ifn/address 2>/dev/null)"
+  echo "operstate=$(cat /sys/class/net/$ifn/operstate 2>/dev/null)"
+  grep -E "^(interface|ssid|mobility_domain|ft_over_ds|nas_identifier|r0kh|r1kh|pmk_r1_push|ft_psk_generate_local|wpa|wpa_key_mgmt|wpa_pairwise|rsn_pairwise|ieee80211w)=" "$f"
+  pp=$(sed -n "s/^wpa_passphrase=//p" "$f")
+  [ -n "$pp" ] && echo "passphrase_sha256=$(printf %s "$pp" | sha256sum 2>/dev/null | cut -d" " -f1)"
+  echo end
+done
+'
+
+cmd_collect() {
+	target=$(echo $ARGS | cut -d' ' -f1)
+	[ -n "$target" ] || die "usage: rrb-unifi-setup collect USER@UNIFI_IP"
+	host=${target#*@}
+	mkdir -p "$DATA" && chmod 700 "$DATA"
+	out=$DATA/unifi-$host.txt
+	say "== Reading the UniFi AP $target (read-only). Enter its SSH password when asked."
+	say "   (UniFi Network: Settings > System > Advanced > Device SSH Authentication)"
+	umask 077
+	{ echo "host=$host"; dbclient -T "$target" "$REMOTE"; } > "$out.tmp" || { rm -f "$out.tmp"; die "SSH to $target failed"; }
+	grep -q '^begin ' "$out.tmp" || { rm -f "$out.tmp"; die "no 802.11r (FT) network found on $target: is Fast Roaming enabled?"; }
+	mv "$out.tmp" "$out"
+	say "Saved to $out (RAM, mode 600). UniFi BSSes with fast roaming:"
+	unifi_records | while IFS='	' read -r h ssid ifn addr md ftds r0id key pmf akm ph oper; do
+		printf '  %-10s %-16s ssid=%s md=%s key=%s %s\n' "$ifn" "$addr" "$ssid" "$md" "$(fp "$key")" "$oper"
+	done
+	say "Next: rrb-unifi-setup verify"
+}
+
+# All collected UniFi FT BSSes, tab separated:
+# host ssid ifname bssid mdid ft_over_ds r0kh-id key pmf akm pass_sha256 operstate
+unifi_records() {
+	for f in "$DATA"/unifi-*.txt; do
+		[ -f "$f" ] || continue
+		awk '
+		function out() {
+			r0 = v["nas_identifier"]
+			if (r0 == "$bssid" || r0 == "") { r0 = tolower(v["addr"]); gsub(":", "", r0) }
+			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", host, v["ssid"], v["interface"],
+				tolower(v["addr"]), v["mobility_domain"], (v["ft_over_ds"] == "" ? "1" : v["ft_over_ds"]),
+				r0, key, (v["ieee80211w"] == "" ? "0" : v["ieee80211w"]), v["wpa_key_mgmt"],
+				v["passphrase_sha256"], v["operstate"]
+		}
+		/^host=/ { host = substr($0, 6); next }
+		/^begin / { split("", v); key = ""; inb = 1; next }
+		/^end$/ { if (inb) out(); inb = 0; next }
+		inb {
+			i = index($0, "="); if (!i) next
+			k = substr($0, 1, i - 1); val = substr($0, i + 1)
+			if (k == "r0kh") { n = split(val, a, " "); if (key == "") key = tolower(a[n]); else if (tolower(a[n]) != key) key = "MIXED" }
+			else v[k] = val
+		}' "$f"
+	done
+}
+
+# ---------------------------------------------------------------- verify
+
+ok=0; fix=0; fail=0
+OK()   { ok=$((ok + 1));   say "  OK    $*"; }
+FIX()  { fix=$((fix + 1)); say "  FIX   $*"; }
+FAIL() { fail=$((fail + 1)); say "  FAIL  $*"; }
+WARN() { say "  WARN  $*"; }
+
+# wifi-iface sections in AP mode with the SSID
+owrt_sections() {
+	for s in $(uci show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get wireless.$s.ssid)" = "$1" ] || continue
+		[ "$(uci -q get wireless.$s.mode)" = ap ] || continue
+		[ "$(uci -q get wireless.$s.disabled)" = 1 ] && continue
+		echo "$s"
+	done
+}
+
+sec_ifname() { ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.*.interfaces[@.section='$1'].ifname" 2>/dev/null; }
+
+# The values every OpenWrt section must have, derived from the UniFi data
+desired() {	# desired SECTION BSSID -> lines "option value" / "list option value"
+	echo "ieee80211r 1"
+	echo "mobility_domain $U_MD"
+	echo "ft_over_ds 0"
+	echo "ft_psk_generate_local 0"
+	echo "pmk_r1_push 1"
+	echo "nasid $(nocolon "$2")"
+	for b in $U_BSSIDS; do
+		echo "list r0kh $b,$(r0id_of "$b"),$U_KEY"
+		echo "list r1kh $b,$b,$U_KEY"
+	done
+	echo "list r0kh ff:ff:ff:ff:ff:ff,*,$U_KEY"
+	echo "list r1kh 00:00:00:00:00:00,00:00:00:00:00:00,$U_KEY"
+}
+
+r0id_of() { unifi_records | awk -F'\t' -v s="$SSID" -v b="$1" '$2 == s && $4 == b { print $7; exit }'; }
+
+pick_ssid() {
+	[ -n "$SSID" ] && return
+	ssids=$(unifi_records | cut -f2 | sort -u)
+	n=0; for x in $ssids; do [ -n "$(owrt_sections "$x")" ] && { SSID=$x; n=$((n + 1)); }; done
+	[ $n -eq 1 ] || die "use --ssid NAME (UniFi fast-roaming SSIDs: $(echo $ssids))"
+}
+
+load_unifi() {
+	ls "$DATA"/unifi-*.txt >/dev/null 2>&1 || die "no UniFi data; run: rrb-unifi-setup collect USER@UNIFI_IP"
+	pick_ssid
+	recs=$(unifi_records | awk -F'\t' -v s="$SSID" '$2 == s')
+	[ -n "$recs" ] || die "SSID '$SSID' has no fast roaming on the UniFi side"
+	U_BSSIDS=$(echo "$recs" | cut -f4 | sort -u)
+	U_MD=$(echo "$recs" | cut -f5 | sort -u)
+	U_KEY=$(echo "$recs" | cut -f8 | sort -u)
+	U_FTDS=$(echo "$recs" | cut -f6 | sort -u)
+	U_PMF=$(echo "$recs" | cut -f9 | sort -u)
+	U_AKM=$(echo "$recs" | cut -f10 | sort -u)
+	U_PASS=$(echo "$recs" | cut -f11 | sort -u)
+	U_HOSTS=$(echo "$recs" | cut -f1 | sort -u)
+}
+
+check_unifi() {
+	say "UniFi side ($(echo $U_HOSTS)), SSID '$SSID':"
+	say "  BSSIDs: $(echo $U_BSSIDS)"
+	[ $(echo "$U_MD" | wc -l) -eq 1 ] && [ -n "$U_MD" ] && OK "mobility domain $U_MD" || FAIL "UniFi BSSes disagree on the mobility domain: $(echo $U_MD)"
+	[ $(echo "$U_KEY" | wc -l) -eq 1 ] && echo "$U_KEY" | grep -qE '^[0-9a-f]{32}([0-9a-f]{32})?$' \
+		&& OK "FT key $(fp "$U_KEY") (same on all UniFi BSSes)" || FAIL "no single valid FT key in the UniFi r0kh lines"
+	[ "$U_FTDS" = 0 ] && OK "UniFi ft_over_ds=0" || FAIL "UniFi uses FT over the DS (ft_over_ds=$U_FTDS); only over-the-air FT is supported"
+	case "$U_AKM" in
+	*FT-SAE*) U_AUTH=sae ;; *FT-PSK*) U_AUTH=psk ;; *) U_AUTH=other ;;
+	esac
+	[ "$U_AUTH" = other ] && FAIL "UniFi key management '$U_AKM' is not FT-PSK/FT-SAE"
+}
+
+check_section() {	# check_section SECTION
+	s=$1
+	ifn=$(sec_ifname "$s")
+	bssid=$(lower "$(cat /sys/class/net/$ifn/address 2>/dev/null)")
+	say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}):"
+	[ -n "$bssid" ] || { FAIL "$s: interface not up, can't read its BSSID"; return; }
+
+	enc=$(uci -q get wireless.$s.encryption)
+	case "$enc" in
+	psk2*|psk-mixed*) o_auth=psk ;; sae-mixed*) o_auth=mixed ;; sae*) o_auth=sae ;; *) o_auth=other ;;
+	esac
+	if [ "$o_auth" = "$U_AUTH" ] || [ "$o_auth" = mixed ]; then OK "security: $enc matches UniFi ($U_AKM)"
+	else FAIL "security: OpenWrt '$enc' vs UniFi '$U_AKM'; make them the same type"; fi
+
+	pass=$(uci -q get wireless.$s.key)
+	if [ -z "$U_PASS" ]; then WARN "UniFi password hash not available, password not compared"
+	elif [ "$(sha "$pass")" = "$U_PASS" ]; then OK "Wi-Fi password matches UniFi (compared as SHA-256)"
+	else FAIL "Wi-Fi password differs from UniFi; set the same password on both (not changed automatically)"; fi
+
+	pmf=$(uci -q get wireless.$s.ieee80211w); [ -n "$pmf" ] || { [ "$o_auth" = sae ] && pmf=2 || { [ "$o_auth" = mixed ] && pmf=1 || pmf=0; }; }
+	if [ "$pmf" = "$U_PMF" ]; then OK "802.11w (PMF) $pmf, same as UniFi"
+	elif [ "$pmf" = 2 ] || [ "$U_PMF" = 2 ]; then FAIL "802.11w: OpenWrt $pmf vs UniFi $U_PMF; a 'required' side blocks roaming clients without PMF"
+	else WARN "802.11w: OpenWrt $pmf vs UniFi $U_PMF"; fi
+
+	desired "$s" "$bssid" > "$DATA/desired.$s"
+	while read -r a b c; do
+		if [ "$a" = list ]; then
+			uci -q get wireless.$s.$b | tr ' ' '\n' | grep -qxF "$c" && OK "$b entry $(echo "$c" | cut -d, -f1-2),$(fp "$U_KEY")" || FIX "$b entry missing: $(echo "$c" | cut -d, -f1-2),<key>"
+		else
+			cur=$(uci -q get wireless.$s.$a)
+			[ "$cur" = "$b" ] && OK "$a=$b" || FIX "$a=${cur:-<unset>} -> $b"
+		fi
+	done < "$DATA/desired.$s"
+	for t in r0kh r1kh; do
+		for e in $(uci -q get wireless.$s.$t); do
+			grep -qxF "list $t $e" "$DATA/desired.$s" || FIX "$t entry not matching UniFi, will be removed: $(echo "$e" | cut -d, -f1-2),<key>"
+		done
+	done
+	opts=$(uci -q get wireless.$s.hostapd_bss_options)
+	echo "$opts" | tr ' ' '\n' | grep -qxF "ft_iface=$(ft_if)" && OK "hostapd_bss_options ft_iface=$(ft_if)" || FIX "hostapd_bss_options: add ft_iface=$(ft_if)"
+}
+
+check_system() {
+	say "OpenWrt system:"
+	for p in $PKGS; do pkg_installed "$p" && OK "package $p" || FAIL "package $p missing (run install)"; done
+	for f in /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi; do [ -f "$f" ] && OK "$f" || FAIL "$f missing (run install)"; done
+	if [ -f "$SRC_DIR/rrb-unifi.uc" ] && [ "$SRC_DIR" != /usr/sbin ] && [ -f /usr/sbin/rrb-unifi.uc ]; then
+		cmp -s "$SRC_DIR/rrb-unifi.uc" /usr/sbin/rrb-unifi.uc && OK "translator is the same version as $SRC_DIR" || WARN "installed translator differs from $SRC_DIR (run install to update)"
+	fi
+	ft=$(ft_if); peer=$(peer_if)
+	if [ "$(cat /sys/class/net/$peer/iflink 2>/dev/null)" = "$(cat /sys/class/net/$ft/ifindex 2>/dev/null)" ] && [ -e /sys/class/net/$ft ]; then
+		OK "veth $ft <-> $peer"
+	else FAIL "veth $ft/$peer missing (run install)"; fi
+	[ -x /etc/init.d/rrb-unifi ] && /etc/init.d/rrb-unifi enabled && OK "service enabled" || FIX "service not enabled"
+}
+
+check_running() {	# after config is applied: running hostapd + translator
+	say "Running state:"
+	if [ -x /etc/init.d/rrb-unifi ] && /etc/init.d/rrb-unifi check >"$DATA/check.out" 2>&1; then
+		OK "rrb-unifi check: $(grep -c ' served' "$DATA/check.out") BSS served, LAN $(sed -n 's/^LAN interface: \([^ ]*\).*/\1/p' "$DATA/check.out")"
+	else
+		FAIL "rrb-unifi check failed:"; sed 's/^/        /' "$DATA/check.out" 2>/dev/null
+	fi
+	/etc/init.d/rrb-unifi running 2>/dev/null && OK "translator running" || FAIL "translator not running"
+	lan=$(sed -n 's/^LAN interface: \([^ ]*\).*/\1/p' "$DATA/check.out" 2>/dev/null)
+	for h in $U_HOSTS; do
+		ping -c1 -W1 "$h" >/dev/null 2>&1
+		dev=$(ip neigh show "$h" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+		[ -n "$dev" ] && [ "$dev" = "$lan" ] && OK "UniFi $h is on the same LAN ($dev)" || FAIL "UniFi $h is not a direct neighbor on $lan (dev ${dev:-none}); inter-AP messages need one layer-2 network"
+	done
+	for s in $(owrt_sections "$SSID"); do
+		ifn=$(sec_ifname "$s")
+		conf=$(grep -lE "^(interface|bss)=$ifn\$" /var/run/hostapd-*.conf 2>/dev/null | head -1)
+		[ -n "$conf" ] || { FAIL "$s: no running hostapd config for $ifn"; continue; }
+		ubus list "hostapd.$ifn" >/dev/null 2>&1 || { FAIL "$ifn: hostapd is not running this BSS (see logread -e hostapd)"; continue; }
+		blk=$(awk -v i="$ifn" '/^(interface|bss)=/ { inb = ($0 == "interface=" i || $0 == "bss=" i) } inb' "$conf")
+		md=$(echo "$blk" | sed -n 's/^mobility_domain=//p'); nas=$(echo "$blk" | sed -n 's/^nas_identifier=//p')
+		n=$(echo "$blk" | grep -c '^r0kh=')
+		[ "$md" = "$U_MD" ] && [ "$nas" = "$(uci -q get wireless.$s.nasid)" ] && [ "$n" -gt 0 ] \
+			&& OK "$ifn running: mobility_domain $md, nas_identifier $nas, $n r0kh" \
+			|| FAIL "$ifn running config differs from uci (md=$md nas=$nas r0kh=$n); wifi reload pending?"
+	done
+}
+
+cmd_verify() {
+	[ -n "$U_KEY" ] || load_unifi
+	check_unifi
+	for s in $(owrt_sections "$SSID"); do check_section "$s"; done
+	[ -n "$(owrt_sections "$SSID")" ] || FAIL "no enabled OpenWrt AP interface with SSID '$SSID'"
+	check_system
+	[ $fix -eq 0 ] && [ $fail -eq 0 ] && check_running
+	say ""
+	say "Result: $ok OK, $fix to fix, $fail failed"
+	[ $fail -gt 0 ] && { say "Fix the FAIL items first (they are not changed automatically)."; return 2; }
+	[ $fix -gt 0 ] && { say "Run: rrb-unifi-setup apply"; return 1; }
+	say "Everything matches."
+	return 0
+}
+
+# ---------------------------------------------------------------- apply
+
+cmd_apply() {
+	load_unifi
+	cmd_verify >"$DATA/verify.out" 2>&1; rc=$?
+	if [ $rc -eq 2 ]; then cat "$DATA/verify.out"; die "verify reports FAIL items; nothing changed"; fi
+	if [ $fix -eq 0 ] && [ $rc -eq 0 ]; then cat "$DATA/verify.out"; say "Nothing to do."; return 0; fi
+	grep -E '^  (FIX|WARN)' "$DATA/verify.out"
+	mkdir -p "$STATE" && chmod 700 "$STATE"
+	bk=$(backup_dir); cp /etc/config/wireless "$bk/wireless"
+	for s in $(owrt_sections "$SSID"); do
+		# remember the original values once, for uninstall
+		[ -f "$STATE/original-$s" ] || uci show wireless.$s > "$STATE/original-$s"
+		uci -q delete wireless.$s.r0kh; uci -q delete wireless.$s.r1kh
+		while read -r a b c; do
+			if [ "$a" = list ]; then uci add_list wireless.$s.$b="$c"; else uci set wireless.$s.$a="$b"; fi
+		done < "$DATA/desired.$s"
+		for o in $(uci -q get wireless.$s.hostapd_bss_options); do
+			case "$o" in ft_iface=*) uci del_list wireless.$s.hostapd_bss_options="$o" ;; esac
+		done
+		uci add_list wireless.$s.hostapd_bss_options="ft_iface=$(ft_if)"
+	done
+	say ""
+	say "Changes (keys hidden):"
+	uci changes wireless | sed -E 's/[0-9a-f]{32,64}/<key>/g; s/^/  /'
+	if ! ask "Apply these changes and reload Wi-Fi?"; then
+		uci revert wireless; die "cancelled, nothing changed"
+	fi
+	uci commit wireless
+	say "Backup of the previous config: $bk/wireless"
+	wifi reload
+	say "Waiting for hostapd to apply the new config..."
+	n=0
+	while [ $n -lt 30 ]; do
+		sleep 2; n=$((n + 2))
+		all=1
+		for s in $(owrt_sections "$SSID"); do
+			ifn=$(sec_ifname "$s")
+			grep -q "^nas_identifier=$(uci -q get wireless.$s.nasid)$" /var/run/hostapd-*.conf 2>/dev/null && ubus list "hostapd.$ifn" >/dev/null 2>&1 || all=0
+		done
+		[ $all = 1 ] && break
+	done
+	/etc/init.d/rrb-unifi enable
+	if /etc/init.d/rrb-unifi running; then /etc/init.d/rrb-unifi restart; else /etc/init.d/rrb-unifi start; fi
+	sleep 3
+	ok=0; fix=0; fail=0
+	cmd_verify
+}
+
+# ---------------------------------------------------------------- uninstall
+
+cmd_uninstall() {
+	say "== rrb-unifi-setup: uninstall"
+	secs=$(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p")
+	say "Wi-Fi interfaces using the translator: $(echo ${secs:-none})"
+	[ $RMPKG = 1 ] && say "Packages to remove: $PKGS"
+	ask "Uninstall rrb-unifi (Wi-Fi reload, network reload)?" || die "cancelled"
+
+	[ -x /etc/init.d/rrb-unifi ] && { /etc/init.d/rrb-unifi stop; /etc/init.d/rrb-unifi disable; }
+	mkdir -p "$STATE" && chmod 700 "$STATE"
+	b=$(backup_dir); cp /etc/config/wireless /etc/config/network "$b/"
+	for s in $secs; do
+		uci del_list wireless.$s.hostapd_bss_options="ft_iface=$(ft_if)"
+		[ -z "$(uci -q get wireless.$s.hostapd_bss_options)" ] && uci -q delete wireless.$s.hostapd_bss_options
+		if [ -f "$STATE/original-$s" ]; then
+			# restore the options this tool manages to their original values
+			for o in ieee80211r mobility_domain ft_over_ds ft_psk_generate_local pmk_r1_push nasid r0kh r1kh; do
+				uci -q delete wireless.$s.$o
+				grep "^wireless\.$s\.$o=" "$STATE/original-$s" | while IFS= read -r line; do
+					val=${line#*=}; val=$(echo "$val" | sed "s/^'//; s/'\$//")
+					case "$o" in
+					r0kh|r1kh) for e in $val; do e=$(echo "$e" | sed "s/^'//; s/'\$//"); uci add_list wireless.$s.$o="$e"; done ;;
+					*) uci set wireless.$s.$o="$val" ;;
+					esac
+				done
+			done
+			say "$s: restored original FT settings"
+		else
+			# no record of the original: back to local key generation
+			uci set wireless.$s.ft_psk_generate_local='1'
+			for o in pmk_r1_push nasid r0kh r1kh; do uci -q delete wireless.$s.$o; done
+			say "$s: ft_psk_generate_local=1, translator settings removed"
+		fi
+	done
+	uci commit wireless
+	wifi reload
+
+	if uci -q get network.vft >/dev/null || uci -q get network.ftlink >/dev/null || uci -q get network.ftpeer >/dev/null; then
+		for x in vft ftlink ftpeer; do uci -q delete network.$x; done
+		uci commit network
+		net_reload_guarded "$b/network"
+	fi
+
+	rm -f /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi /etc/config/rrb-unifi
+	sed -i '/^\/usr\/sbin\/rrb-unifi\.uc$/d; /^\/etc\/init\.d\/rrb-unifi$/d; /^\/etc\/rc\.d\/S99rrb-unifi$/d; /^\/usr\/sbin\/rrb-unifi-setup$/d' /etc/sysupgrade.conf
+	if [ $RMPKG = 1 ]; then
+		pkg_remove $PKGS && rm -f "$STATE/installed-packages"
+	fi
+	say "Uninstalled. Backups and original values stay in $STATE"
+	say "(remove with: rm -r $STATE /usr/sbin/rrb-unifi-setup)"
+}
+
+# ----------------------------------------------------------------
+
+case "$CMD" in
+install) cmd_install ;;
+collect) cmd_collect ;;
+verify|status) cmd_verify ;;
+apply) cmd_apply ;;
+uninstall) cmd_uninstall ;;
+confirm) touch "$CONFIRM" && say "Network change confirmed." ;;
+*) sed -n '2,/^$/s/^# \{0,1\}//p' "$SELF" | sed -n '4,20p'; exit 1 ;;
+esac
