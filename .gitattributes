@@ -1,0 +1,3 @@
+# The scripts run on OpenWrt and break with Windows line endings: always
+# check out with LF, also on Windows (core.autocrlf=true).
+* text=auto eol=lf
