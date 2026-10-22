@@ -10,8 +10,9 @@ dropped the connection. This project translates between the two formats on the
 OpenWrt side. Nothing on the UniFi AP is changed. Phones then roam between
 UniFi and OpenWrt APs as smoothly as between two UniFi APs, without dropping
 Wi-Fi calls or video calls. A spare router running OpenWrt becomes a real
-part of your UniFi network for roaming. It won't appear in the UniFi
-controller, though: you still manage it through OpenWrt.
+part of your UniFi network for roaming. On its own it won't appear in the
+UniFi controller: you still manage it through OpenWrt. To manage it from
+UniFi as well, combine it with openUF, see [With openUF](#with-openuf).
 
 Use this if you added an OpenWrt AP to a UniFi network, enabled fast roaming
 on both, copied the mobility domain, and roaming *mostly* works, but sometimes
@@ -140,7 +141,7 @@ Both FT key distribution modes then work:
 | `rrb-unifi.uc` | `/usr/sbin/rrb-unifi.uc` | The translator daemon (ucode). Converts RRB-OUI frames between hostapd's private veth link and the LAN, adding or removing UniFi's 12-byte header. |
 | `rrb-unifi.init` | `/etc/init.d/rrb-unifi` | procd init script. Starts the translator at boot, restarts it if it stops, and restarts it when the wireless or network config changes. `/etc/init.d/rrb-unifi check` shows what it derives from the running config. |
 | `rrb-unifi.config` | `/etc/config/rrb-unifi` | Optional settings: verbose logging, veth names, LAN interface override. All have defaults. |
-| `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values. Also uninstalls. |
+| `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values, or, with openUF, writes the UniFi peer list openUF needs. Also uninstalls. |
 | `tools/rrb-decrypt.py` | (runs on a PC) | Diagnostic tool. Decrypts captured RRB-OUI frames with your r0kh/r1kh key and shows which format each AP uses. Optional; not needed for normal use. |
 | `LICENSE` | | GNU General Public License v3.0. |
 
@@ -165,6 +166,7 @@ What was tested on which version:
 | Pull right after a reboot | yes | no |
 | hostapd restart, custom `ifname` | yes | no |
 | Firmware upgrade with the project installed | 24.10.4 to 25.12.6, see [After a firmware upgrade](#after-a-firmware-upgrade) | |
+| With openUF: `collect`, `verify`, `peers`, walk tests | no | yes, adopted into a UCG Ultra |
 
 Not tested yet:
 
@@ -174,6 +176,8 @@ Not tested yet:
 - more than one UniFi AP, `--ssid`
 - WPA3/SAE, 802.11w, other UniFi models, other OpenWrt devices
 - several OpenWrt APs with the translator
+- with openUF: `uninstall`, and installing the translator after openUF
+  (it was installed before)
 
 Reports are welcome.
 
@@ -346,6 +350,47 @@ If several SSIDs have fast roaming, add `--ssid NAME` to `verify` and `apply`.
 `--yes` answers every question with yes, for scripted use. Then nothing
 waits for Enter after a network reload: confirm the change from a **new** SSH
 session within 120 seconds with `rrb-unifi-setup confirm`, or it is restored.
+
+### With openUF
+
+[openUF](https://github.com/jonasevcik/openUF) makes an OpenWrt AP show up in
+the UniFi controller as a UniFi AP, so you manage its Wi-Fi from UniFi. Then
+openUF owns the Wi-Fi sections and rewrites them on every config push, so
+`apply` must not touch them. Instead, openUF writes the fast-roaming settings
+itself when its `unifi_ft_interop` option is on, and takes the list of UniFi
+APs from this project's `/etc/config/rrb-unifi`.
+
+`unifi_ft_interop` is proposed upstream and not merged yet. Until then it is on
+the `pr/unifi-ft-interop` branch of
+[d-malinowski/openUF](https://github.com/d-malinowski/openUF/tree/pr/unifi-ft-interop).
+
+The steps, tested in this order:
+
+1. Install the translator and check it without openUF first, as in
+   [Quick install](#quick-install-with-rrb-unifi-setup-recommended)
+   (steps 1 to 5 and the walk tests).
+2. Install openUF and set `unifi_ft_interop = true` in its `conf.lua`. In
+   UniFi, Fast Roaming must be on for the WLAN. Then adopt the AP.
+3. Write the UniFi APs into the peer list:
+
+   ```sh
+   rrb-unifi-setup collect USER@UNIFI_IP
+   rrb-unifi-setup peers
+   ```
+
+   `peers` shows the list and asks before it writes it. openUF uses it on its
+   next config push: click **Force Provision** for the AP in UniFi.
+4. `rrb-unifi-setup verify` recognises openUF's sections. A wrong value there
+   is reported as `FAIL` with a hint (it can't be fixed by `apply`, because
+   openUF would overwrite it). `apply` refuses to run on them.
+
+Then do the walk tests again. Run `collect` and `peers` again whenever a UniFi
+AP is added or replaced.
+
+To uninstall the translator, take the AP out of openUF first (Forget it in
+UniFi while openUF runs: openUF then removes its own sections). As long as
+openUF's sections exist, `uninstall` refuses, because openUF would put the
+translator settings back.
 
 ### After a firmware upgrade
 
@@ -667,6 +712,18 @@ Then remove the packages if nothing else needs them:
 
 
 ## Changes
+
+### 1.2
+
+- openUF mode: when openUF manages the Wi-Fi sections, `rrb-unifi-setup peers`
+  writes the UniFi APs' BSSes into `/etc/config/rrb-unifi` (`list ft_peer`)
+  for openUF's `unifi_ft_interop`, and `verify` checks openUF's sections
+  (reported as `FAIL` with a hint, since `apply` can't change them). `apply`
+  and `uninstall` refuse to touch openUF's sections. See
+  [With openUF](#with-openuf).
+- Tested on 25.12.6 with the HH5A adopted into a UCG Ultra through openUF:
+  `collect`, `peers`, `verify` all OK, walk tests passed.
+- Only the setup tool changed; the translator is the same as in 1.1.
 
 ### 1.1
 
