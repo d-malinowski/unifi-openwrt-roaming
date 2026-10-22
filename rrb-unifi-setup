@@ -531,7 +531,7 @@ cmd_peers() {
 cmd_uninstall() {
 	say "== rrb-unifi-setup: uninstall"
 	for s in $(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p"); do
-		is_openuf "$s" && die "'$s' is provisioned by openUF; stop openUF first (it would put ft_iface back)"
+		is_openuf "$s" && die "'$s' is provisioned by openUF, which would put ft_iface back; take the AP out of openUF first (Forget it in UniFi while openUF runs)"
 	done
 	secs=$(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p")
 	say "Wi-Fi interfaces using the translator: $(echo ${secs:-none})"
