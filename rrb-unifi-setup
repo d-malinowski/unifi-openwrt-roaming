@@ -11,14 +11,20 @@
 #   rrb-unifi-setup collect USER@HOST  read the UniFi AP (asks for its SSH password)
 #   rrb-unifi-setup verify [--ssid S]  compare both sides, show what is wrong
 #   rrb-unifi-setup apply  [--ssid S] [--yes]   fix OpenWrt from the UniFi values
+#   rrb-unifi-setup peers  [--ssid S] [--yes]   write the UniFi peer list for openUF
 #   rrb-unifi-setup uninstall [--remove-packages] [--yes]
 #   rrb-unifi-setup confirm            keep a network change (see install)
+#
+# With openUF (a UniFi controller manages the OpenWrt AP), the Wi-Fi sections
+# belong to openUF, which writes the FT settings itself (unifi_ft_interop) and
+# takes the UniFi peers from rrb-unifi's ft_peer list. Then `peers` replaces
+# `apply`, and `verify` checks openUF's sections the same way.
 #
 # Secrets: collected data (it contains the FT key) stays in RAM
 # (/tmp/rrb-unifi-setup, mode 600). Only a SHA-256 of the Wi-Fi password is
 # read from the UniFi AP, never the password itself. Keys are never printed.
 
-VERSION=1.1
+VERSION=1.2
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SRC_DIR=$(dirname "$SELF")
 STATE=/etc/rrb-unifi-setup		# backups, original values (persistent)
@@ -269,6 +275,13 @@ owrt_sections() {
 
 sec_ifname() { ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.*.interfaces[@.section='$1'].ifname" 2>/dev/null; }
 
+# A section openUF provisioned from the controller (and rewrites on every push)
+is_openuf() { [ -n "$(uci -q get wireless.$1.openuf_wlanconf_id)" ]; }
+openuf_mode() { for s in $(owrt_sections "$SSID"); do is_openuf "$s" && return 0; done; return 1; }
+
+# The ft_peer entries openUF needs: every UniFi BSS of the SSID, "bssid,r0kh-id"
+desired_peers() { for b in $U_BSSIDS; do echo "$b,$(r0id_of "$b")"; done; }
+
 # The values every OpenWrt section must have, derived from the UniFi data
 desired() {	# desired SECTION BSSID -> lines "option value" / "list option value"
 	echo "ieee80211r 1"
@@ -326,7 +339,14 @@ check_section() {	# check_section SECTION
 	s=$1
 	ifn=$(sec_ifname "$s")
 	bssid=$(lower "$(cat /sys/class/net/$ifn/address 2>/dev/null)")
-	say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}):"
+	if is_openuf "$s"; then
+		say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}, provisioned by openUF):"
+		# apply can't fix these: openUF rewrites the section on every push
+		SFIX() { FAIL "$* (written by openUF: check unifi_ft_interop, run 'rrb-unifi-setup peers', then Force Provision)"; }
+	else
+		say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}):"
+		SFIX() { FIX "$@"; }
+	fi
 	[ -n "$bssid" ] || { FAIL "$s: interface not up, can't read its BSSID"; return; }
 
 	enc=$(uci -q get wireless.$s.encryption)
@@ -349,19 +369,19 @@ check_section() {	# check_section SECTION
 	desired "$s" "$bssid" > "$DATA/desired.$s"
 	while read -r a b c; do
 		if [ "$a" = list ]; then
-			uci -q get wireless.$s.$b | tr ' ' '\n' | grep -qxF "$c" && OK "$b entry $(echo "$c" | cut -d, -f1-2),$(fp "$U_KEY")" || FIX "$b entry missing: $(echo "$c" | cut -d, -f1-2),<key>"
+			uci -q get wireless.$s.$b | tr ' ' '\n' | grep -qxF "$c" && OK "$b entry $(echo "$c" | cut -d, -f1-2),$(fp "$U_KEY")" || SFIX "$b entry missing: $(echo "$c" | cut -d, -f1-2),<key>"
 		else
 			cur=$(uci -q get wireless.$s.$a)
-			[ "$cur" = "$b" ] && OK "$a=$b" || FIX "$a=${cur:-<unset>} -> $b"
+			[ "$cur" = "$b" ] && OK "$a=$b" || SFIX "$a=${cur:-<unset>} -> $b"
 		fi
 	done < "$DATA/desired.$s"
 	for t in r0kh r1kh; do
 		for e in $(uci -q get wireless.$s.$t); do
-			grep -qxF "list $t $e" "$DATA/desired.$s" || FIX "$t entry not matching UniFi, will be removed: $(echo "$e" | cut -d, -f1-2),<key>"
+			grep -qxF "list $t $e" "$DATA/desired.$s" || SFIX "$t entry not matching UniFi, will be removed: $(echo "$e" | cut -d, -f1-2),<key>"
 		done
 	done
 	opts=$(uci -q get wireless.$s.hostapd_bss_options)
-	echo "$opts" | tr ' ' '\n' | grep -qxF "ft_iface=$(ft_if)" && OK "hostapd_bss_options ft_iface=$(ft_if)" || FIX "hostapd_bss_options: add ft_iface=$(ft_if)"
+	echo "$opts" | tr ' ' '\n' | grep -qxF "ft_iface=$(ft_if)" && OK "hostapd_bss_options ft_iface=$(ft_if)" || SFIX "hostapd_bss_options: add ft_iface=$(ft_if)"
 }
 
 check_system() {
@@ -406,17 +426,29 @@ check_running() {	# after config is applied: running hostapd + translator
 	done
 }
 
+check_peers() {	# openUF mode: rrb-unifi's ft_peer list = the UniFi BSSes
+	say "openUF peer list (/etc/config/rrb-unifi ft_peer):"
+	have=$(uci -q get rrb-unifi.main.ft_peer | tr ' ' '\n' | sed '/^$/d' | sort)
+	want=$(desired_peers | sort)
+	if [ "$have" = "$want" ]; then OK "ft_peer: $(echo $want)"
+	else FIX "ft_peer: $(echo ${have:-<none>}) -> $(echo $want)"; fi
+}
+
 cmd_verify() {
 	[ -n "$U_KEY" ] || load_unifi
 	check_unifi
 	for s in $(owrt_sections "$SSID"); do check_section "$s"; done
 	[ -n "$(owrt_sections "$SSID")" ] || FAIL "no enabled OpenWrt AP interface with SSID '$SSID'"
+	openuf_mode && check_peers
 	check_system
 	[ $fix -eq 0 ] && [ $fail -eq 0 ] && check_running
 	say ""
 	say "Result: $ok OK, $fix to fix, $fail failed"
 	[ $fail -gt 0 ] && { say "Fix the FAIL items first (they are not changed automatically)."; return 2; }
-	[ $fix -gt 0 ] && { say "Run: rrb-unifi-setup apply"; return 1; }
+	if [ $fix -gt 0 ]; then
+		openuf_mode && say "Run: rrb-unifi-setup peers" || say "Run: rrb-unifi-setup apply"
+		return 1
+	fi
 	say "Everything matches."
 	return 0
 }
@@ -425,6 +457,7 @@ cmd_verify() {
 
 cmd_apply() {
 	load_unifi
+	openuf_mode && die "the '$SSID' sections are provisioned by openUF and rewritten on every push; use: rrb-unifi-setup peers"
 	cmd_verify >"$DATA/verify.out" 2>&1; rc=$?
 	if [ $rc -eq 2 ]; then cat "$DATA/verify.out"; die "verify reports FAIL items; nothing changed"; fi
 	if [ $fix -eq 0 ] && [ $rc -eq 0 ]; then cat "$DATA/verify.out"; say "Nothing to do."; return 0; fi
@@ -470,10 +503,36 @@ cmd_apply() {
 	cmd_verify
 }
 
+# ---------------------------------------------------------------- peers (openUF)
+
+# openUF writes the FT settings from the controller's push; the one thing it
+# can't know is which BSSes the UniFi APs have. Write them from the collected
+# UniFi data. Takes effect on openUF's next config push (Force Provision).
+cmd_peers() {
+	load_unifi
+	check_unifi >/dev/null
+	[ $fail -eq 0 ] || { check_unifi; die "UniFi data is not usable; nothing changed"; }
+	want=$(desired_peers)
+	have=$(uci -q get rrb-unifi.main.ft_peer | tr ' ' '\n' | sed '/^$/d')
+	if [ "$(echo "$have" | sort)" = "$(echo "$want" | sort)" ]; then
+		say "ft_peer already matches: $(echo $want)"; return 0
+	fi
+	say "ft_peer: $(echo ${have:-<none>})"
+	say "     -> $(echo $want)"
+	ask "Write this peer list to /etc/config/rrb-unifi?" || die "cancelled, nothing changed"
+	uci -q delete rrb-unifi.main.ft_peer
+	for p in $want; do uci add_list rrb-unifi.main.ft_peer="$p"; done
+	uci commit rrb-unifi
+	say "Written. openUF uses it on its next config push: Force Provision the AP in UniFi."
+}
+
 # ---------------------------------------------------------------- uninstall
 
 cmd_uninstall() {
 	say "== rrb-unifi-setup: uninstall"
+	for s in $(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p"); do
+		is_openuf "$s" && die "'$s' is provisioned by openUF; stop openUF first (it would put ft_iface back)"
+	done
 	secs=$(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p")
 	say "Wi-Fi interfaces using the translator: $(echo ${secs:-none})"
 	[ $RMPKG = 1 ] && say "Packages to remove: $PKGS"
@@ -530,7 +589,8 @@ install) cmd_install ;;
 collect) cmd_collect ;;
 verify|status) cmd_verify ;;
 apply) cmd_apply ;;
+peers) cmd_peers ;;
 uninstall) cmd_uninstall ;;
 confirm) touch "$CONFIRM" && say "Network change confirmed." ;;
-*) sed -n '2,/^$/s/^# \{0,1\}//p' "$SELF" | sed -n '4,20p'; exit 1 ;;
+*) sed -n '2,/^$/s/^# \{0,1\}//p' "$SELF" | sed -n '4,26p'; exit 1 ;;
 esac
