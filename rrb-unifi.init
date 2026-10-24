@@ -21,6 +21,7 @@ load_settings() {
 	config_get PEER_IF main peer_iface vft1
 	config_get LAN_IF main lan_iface ''
 	config_get WAIT main wait 120
+	config_get_bool ROAM main roam_announce 1
 }
 
 start_service() {
@@ -28,7 +29,8 @@ start_service() {
 	procd_open_instance
 	procd_set_param command /usr/bin/ucode /usr/sbin/rrb-unifi.uc
 	procd_set_param env RRB_FT_IF="$FT_IF" RRB_PEER_IF="$PEER_IF" \
-		RRB_LAN_IF="$LAN_IF" RRB_WAIT="$WAIT" RRB_VERBOSE="$VERBOSE"
+		RRB_LAN_IF="$LAN_IF" RRB_WAIT="$WAIT" RRB_VERBOSE="$VERBOSE" \
+		RRB_ROAM="$ROAM"
 	# give up after 5 quick failures (config errors), see logread
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
@@ -49,6 +51,6 @@ reload_service() {
 
 check() {
 	load_settings
-	RRB_CHECK=1 RRB_FT_IF="$FT_IF" RRB_PEER_IF="$PEER_IF" RRB_LAN_IF="$LAN_IF" \
+	RRB_CHECK=1 RRB_FT_IF="$FT_IF" RRB_PEER_IF="$PEER_IF" RRB_LAN_IF="$LAN_IF" RRB_ROAM="$ROAM" \
 		/usr/bin/ucode /usr/sbin/rrb-unifi.uc
 }

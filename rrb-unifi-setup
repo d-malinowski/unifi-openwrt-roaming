@@ -24,7 +24,7 @@
 # (/tmp/rrb-unifi-setup, mode 600). Only a SHA-256 of the Wi-Fi password is
 # read from the UniFi AP, never the password itself. Keys are never printed.
 
-VERSION=1.2
+VERSION=1.3
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SRC_DIR=$(dirname "$SELF")
 STATE=/etc/rrb-unifi-setup		# backups, original values (persistent)
