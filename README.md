@@ -113,7 +113,8 @@ that don't decrypt point to a wrong key or another format.
   - from hostapd: insert the source and destination BSSID, send to the LAN
   - from a UniFi AP: strip them, hand the message to hostapd with those
     BSSIDs as the Ethernet addresses
-- The encrypted content is never touched. The script doesn't need the key.
+- The encrypted content is never touched. Translating needs no key (the roam
+  announcements below do).
 
 Nothing about your setup is hardcoded. At startup the translator reads the
 running hostapd configs (`/var/run/hostapd-*.conf`) and serves every BSS
@@ -134,13 +135,56 @@ Both FT key distribution modes then work:
   on OpenWrt, so the UniFi AP already has it when the client roams
 
 
+## Roam announcements
+
+A client that roams says nothing to the AP it leaves. That AP keeps it listed
+until its own timers drop it, about 20 s later on a UniFi U7. UniFi APs avoid
+this with an announcement of their own: on every association the new AP
+broadcasts "this client is mine now", and the old one drops it at once. With
+only OpenWrt on one side, the UniFi AP never hears it. The UniFi controller
+then sees the departure too late to pair it with the arrival, so the roam is
+listed late, with the wrong signal, and without its Fast Roaming tag.
+
+Since 1.3 the translator speaks this announcement (`UBNT_ROAM`, ethertype
+0x890d, to `01:80:c2:00:00:1c`):
+
+- when hostapd authorizes a client on a served BSS, it sends one to the LAN
+- when a UniFi AP announces a client that is still associated here, it
+  disassociates it (hostapd `del_client`, reason 2), unless the client came
+  back here after the announcement
+
+The format, from UniFi's hostapd (firmware 8.7.11) and checked byte for byte
+against frames a U7 sent:
+
+```
+01 f0 1a 00 | sender BSSID (6) | wlan_id (2) | AES key wrap (32) | 20 zero bytes
+wrapped:      time in seconds (LE32) | client MAC (6) | 14 zero bytes
+```
+
+`wlan_id` is the mobility domain, and the key wrap (RFC 3394) uses the same
+key as `r0kh`/`r1kh`: both are the UniFi controller's per-WLAN values, which
+OpenWrt already has for fast roaming. So the translator reads, for each served
+BSS, `mobility_domain` and the key of the wildcard `r0kh=ff:ff:ff:ff:ff:ff *`
+line from the running hostapd config. It never logs the key. A receiver drops
+announcements more than 60 s old, so both APs need the right time (NTP).
+
+Cost: one AES key wrap per client authorization and one unwrap per UniFi
+announcement on the same WLAN, about 0.1 s of CPU each on a 500 MHz MIPS (BT
+Home Hub 5A). Announcements for other WLANs are dropped before decryption.
+
+This needs `ucode-mod-ubus` and `ucode-mod-uloop`, which hostapd itself
+depends on. Without them, with `option roam_announce '0'`, or when no served
+BSS has a mobility domain and a wildcard key, only the announcements are off.
+Key translation works as before.
+
+
 ## Files
 
 | File | Installed as | Description |
 |---|---|---|
-| `rrb-unifi.uc` | `/usr/sbin/rrb-unifi.uc` | The translator daemon (ucode). Converts RRB-OUI frames between hostapd's private veth link and the LAN, adding or removing UniFi's 12-byte header. |
+| `rrb-unifi.uc` | `/usr/sbin/rrb-unifi.uc` | The translator daemon (ucode). Converts RRB-OUI frames between hostapd's private veth link and the LAN, adding or removing UniFi's 12-byte header, and sends and receives UniFi's roam announcements. |
 | `rrb-unifi.init` | `/etc/init.d/rrb-unifi` | procd init script. Starts the translator at boot, restarts it if it stops, and restarts it when the wireless or network config changes. `/etc/init.d/rrb-unifi check` shows what it derives from the running config. |
-| `rrb-unifi.config` | `/etc/config/rrb-unifi` | Optional settings: verbose logging, veth names, LAN interface override. All have defaults. |
+| `rrb-unifi.config` | `/etc/config/rrb-unifi` | Optional settings: verbose logging, veth names, LAN interface override, roam announcements on/off. All have defaults. |
 | `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values, or, with openUF, writes the UniFi peer list openUF needs. Also uninstalls. |
 | `tools/rrb-decrypt.py` | (runs on a PC) | Diagnostic tool. Decrypts captured RRB-OUI frames with your r0kh/r1kh key and shows which format each AP uses. Optional; not needed for normal use. |
 | `LICENSE` | | GNU General Public License v3.0. |
@@ -167,6 +211,7 @@ What was tested on which version:
 | hostapd restart, custom `ifname` | yes | no |
 | Firmware upgrade with the project installed | 24.10.4 to 25.12.6, see [After a firmware upgrade](#after-a-firmware-upgrade) | |
 | With openUF: `collect`, `verify`, `peers`, walk tests | no | yes, adopted into a UCG Ultra |
+| Roam announcements (1.3), walk tests | no | yes, with openUF |
 
 Not tested yet:
 
@@ -187,7 +232,9 @@ Reports are welcome.
 - OpenWrt 24.10 or newer, with hostapd/wpad (see
   [Which wpad package?](#which-wpad-package))
 - The packages `ucode-mod-socket` and `kmod-veth`. The setup tool installs
-  them, so the OpenWrt AP needs internet access during the install.
+  them, so the OpenWrt AP needs internet access during the install. The roam
+  announcements also use `ucode-mod-ubus` and `ucode-mod-uloop`, which come
+  with hostapd.
 - SSH access to the UniFi AP, to read its FT settings (Network app: Settings,
   System, Advanced, Device SSH Authentication). The setup tool uses
   OpenWrt's built-in SSH client (`dbclient`), nothing extra is needed.
@@ -642,6 +689,17 @@ uci set rrb-unifi.main.verbose='0' && uci commit rrb-unifi && /etc/init.d/rrb-un
   hasn't been needed yet.
 - No Wi-Fi at all after a firmware upgrade: see
   [After a firmware upgrade](#after-a-firmware-upgrade).
+- Roam announcements: `check` shows `UBNT_ROAM: on for ...` with each BSS's
+  `wlan_id`, or why they are off. In the log:
+  - `UBNT_ROAM from <BSSID> ...: key verified`: the first announcement from
+    that UniFi BSS decrypted with this BSS's key, so both sides agree.
+  - `... does not decrypt with this BSS's r0kh key`: the wildcard `r0kh` key
+    is not the UniFi WLAN's key. Fast roaming would fail too; rerun the setup.
+  - `... ignored: clock differs by N s (NTP?)`: one of the two APs has the
+    wrong time.
+  - `UBNT_ROAM: <client> roamed to <BSSID>; disassociated from <iface>`: a
+    client left for a UniFi AP and was dropped here at once.
+  With `option verbose '1'` every announcement sent is logged too.
 
 
 ## Notes and limitations
@@ -657,8 +715,12 @@ uci set rrb-unifi.main.verbose='0' && uci commit rrb-unifi && /etc/init.d/rrb-un
 - `kmod-veth` and `ucode-mod-socket` are not kept by a plain sysupgrade, and
   a full wpad can go back to basic: the OpenWrt AP has no Wi-Fi until you
   follow [After a firmware upgrade](#after-a-firmware-upgrade).
-- Only RRB-OUI (0x88b7) is translated. FT over the DS uses ethertype 0x890d and
-  is not handled; keep `ft_over_ds=0`, which is the UniFi default.
+- Only RRB-OUI (0x88b7) is translated. FT over the DS also uses ethertype
+  0x890d and is not handled; keep `ft_over_ds=0`, which is the UniFi default.
+  On 0x890d the translator handles only UniFi's roam announcements.
+- Roam announcements for clients that use Wi-Fi 7 multi-link (MLO) on the UniFi
+  AP carry the client's MLD address. If that differs from the address the
+  client uses on OpenWrt, nothing is dropped here, which is the 1.2 behaviour.
 - With several OpenWrt APs, each one needs the translator. OpenWrt-to-OpenWrt
   key exchange also goes through it in UniFi format, which is untested.
 - A UniFi firmware update could change the format again. If roaming to UniFi
@@ -712,6 +774,23 @@ Then remove the packages if nothing else needs them:
 
 
 ## Changes
+
+### 1.3
+
+- Roam announcements (`UBNT_ROAM`): the translator tells UniFi APs when a
+  client arrives on OpenWrt, so they drop it at once, and drops a client here
+  when a UniFi AP announces it. See [Roam announcements](#roam-announcements).
+  New option `roam_announce` (default on).
+- AES (T-tables) and AES key wrap in plain ucode, checked at startup against
+  the FIPS-197 and RFC 3394 test vectors, and offline against 200 random
+  OpenSSL results and frames captured from a U7. About 5 ms per AES block,
+  0.1 s per announcement, on the HH5A.
+- Tested offline (ucode at OpenWrt 25.12's version, mock hostapd) and on
+  25.12.6 with the HH5A adopted into a UCG Ultra through openUF: walk tests
+  both ways. The U7 drops a client about a second after it arrives on
+  OpenWrt, and the controller now records U7 -> OpenWrt roams as paired fast
+  roams (before, only through its own fallback, without the Fast Roaming
+  flag).
 
 ### 1.2
 
