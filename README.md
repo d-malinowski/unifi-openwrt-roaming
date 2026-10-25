@@ -178,6 +178,34 @@ BSS has a mobility domain and a wildcard key, only the announcements are off.
 Key translation works as before.
 
 
+## Learned peers
+
+A UniFi AP's R0KH-ID is its BSSID without colons (`nas_identifier=$bssid` in
+its hostapd config), so the `r0kh`/`r1kh` lines the OpenWrt side needs for a
+UniFi peer follow from its BSSID alone. The translator hears those BSSIDs:
+every roam announcement it verifies with a WLAN's key names the sender and the
+WLAN (`wlan_id`, the mobility domain), and every UniFi-framed RRB frame
+addressed to one of the served BSSes names its sender.
+
+With `option peers_file '/var/run/rrb-unifi/peers.json'` (default: off) the
+daemon records them there as JSON:
+
+```json
+{"ab:cd:ef:00:11:22": {"md": "5de5", "seen": 1761400000, "via": "roam"},
+ "ab:cd:ef:00:11:33": {"md": null, "seen": 1761399000, "via": "rrb"}}
+```
+
+`md` stays `null` for a BSSID seen only in RRB frames, since those do not say
+which WLAN the AP serves; an announcement fills it in. The file is written at
+once when a BSSID or its domain is new, otherwise at most once a minute for
+the timestamps, and read back at start, so a restart within a boot keeps what
+was learned (it lives in tmpfs, so a reboot starts over). At most 256 entries.
+
+Whoever writes the key holders can take the peers from here instead of reading
+them off the UniFi AP: openUF does (it keeps them in its state and
+re-provisions when a new one appears), and `rrb-unifi-setup collect` remains
+the way to check the UniFi side's full settings.
+
 ## Files
 
 | File | Installed as | Description |
@@ -774,6 +802,19 @@ Then remove the packages if nothing else needs them:
 
 
 ## Changes
+
+### Unreleased
+
+- `option wait '0'`: no deadline. The daemon waits for the veth pair and then
+  for a BSS on it, however long, instead of exiting for procd to respawn it.
+  For a system that runs the translator as a service from boot and creates
+  the veth and the FT WLAN later (openUF does both on its first config push
+  with a fast-roaming WLAN).
+- `option peers_file`: the UniFi APs heard on the LAN, recorded as JSON with
+  the WLAN's mobility domain once a verified roam announcement names it
+  (see "Learned peers"). Off by default.
+- Both came from openUF, which carries this translator built in since
+  2026-10-25 and would rather carry no local changes.
 
 ### 1.3
 

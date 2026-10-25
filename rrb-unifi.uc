@@ -35,6 +35,16 @@
 // hostapd itself depends on; without them only this part is disabled.
 //
 // RRB_CHECK=1 prints what was derived and exits (see "rrb-unifi check").
+//
+// RRB_WAIT=0 waits without a deadline, for the veth pair and then for a BSS
+// on it, instead of exiting: for a system that runs the translator as a
+// service from boot and creates the veth and the FT WLAN later (openUF does).
+//
+// RRB_PEERS_FILE, when set, records every UniFi BSSID heard on the LAN as
+// JSON, with the WLAN's mobility domain once a roam announcement verified with
+// that WLAN's key names it, so whoever writes hostapd's key holders (the setup
+// tool, or openUF) can take the peers from here instead of reading them off
+// the UniFi AP over SSH. A UniFi AP's R0KH-ID is its BSSID without colons.
 'use strict';
 
 import * as socket from 'socket';
@@ -57,6 +67,7 @@ const VERBOSE = getenv('RRB_VERBOSE') == '1';
 const CHECK = getenv('RRB_CHECK') == '1';
 const ROAM = getenv('RRB_ROAM') != '0';
 const RELOAD_FLAG = '/tmp/rrb-unifi.wifi-reloaded';	// tmpfs: once per boot
+const PEERS_FILE = getenv('RRB_PEERS_FILE') || '';	// learned UniFi BSSIDs, JSON; empty = off
 
 let local = {};		// local BSSIDs ("aa:bb:..") -> interface name
 let remote = {};	// BSSIDs of other APs we injected frames for
@@ -65,6 +76,8 @@ let last_refresh = 0;
 let roam_bss = {};	// served ifname -> { bssid, md, w } for UBNT_ROAM
 let authz = {};		// client MAC -> { ifname, t } authorized here
 let roam_noted = {};	// one-time UBNT_ROAM log lines
+let peers = {};		// UniFi BSSID -> { md, seen, via }, what PEERS_FILE holds
+let peers_written = 0;	// when PEERS_FILE was last written
 
 // stdout is logged by procd at info level (stderr would show up as daemon.err)
 function log(msg) {
@@ -107,6 +120,50 @@ function body_ok(f, off) {
 
 function sysfs(ifn, attr) {
 	return trim(readfile(`/sys/class/net/${ifn}/${attr}`) || '');
+}
+
+// ---- learned peers (PEERS_FILE) ---------------------------------------------
+// The UniFi BSSIDs this AP has heard from. A BSSID comes with its mobility
+// domain only from a roam announcement that this WLAN's key verified
+// (roam_rx); an RRB frame addressed to one of our BSSes (from_lan) names the
+// sender but not its WLAN, so md stays null until an announcement fills it
+// in. Written at once when a BSSID or its domain is new, otherwise at most
+// once a minute for the timestamps. Read back at start so a restart within a
+// boot keeps what was learned.
+function peers_load() {
+	if (!PEERS_FILE)
+		return;
+	let d = json(readfile(PEERS_FILE) || 'null');
+	if (type(d) == 'object')
+		peers = d;
+}
+
+function peers_write(now) {
+	writefile(PEERS_FILE, sprintf('%J\n', peers));
+	peers_written = now;
+}
+
+function peer_seen(bssid, md, via) {
+	if (!PEERS_FILE || local[bssid])
+		return;
+	let now = time(), p = peers[bssid];
+	if (!p) {
+		peers[bssid] = { md, seen: now, via };
+		if (length(keys(peers)) > 256)
+			peers = { [bssid]: peers[bssid] };
+		peers_write(now);
+		log(`UniFi AP learned: ${bssid}${md ? ` (wlan_id ${md})` : ''}`);
+	} else {
+		p.seen = now;
+		if (md && p.md != md) {
+			p.md = md;
+			p.via = via;
+			peers_write(now);
+			log(`UniFi AP ${bssid} is on wlan_id ${md}`);
+		} else if (now - peers_written >= 60) {
+			peers_write(now);
+		}
+	}
 }
 
 // All BSS blocks of all running hostapd configs. A block starts at
@@ -467,6 +524,7 @@ function roam_rx(f) {
 		return;
 	}
 	roam_note(`ok ${r.bssid}`, `UBNT_ROAM from ${r.bssid} (wlan_id ${r.md}): key verified`);
+	peer_seen(r.bssid, r.md, 'roam');
 	let now = time();
 	if (r.ts > now + ROAM_SKEW || r.ts < now - ROAM_SKEW) {
 		roam_note(`skew ${r.bssid}`, `UBNT_ROAM from ${r.bssid} ignored: clock differs by ${now - r.ts} s (NTP?)`);
@@ -566,7 +624,7 @@ function check() {
 // did not exist yet when Wi-Fi started), run "wifi up" once per boot.
 // ("wifi reload" does not restart a BSS that failed: it only reloads settings.)
 function startup() {
-	let start = time(), found = 0;
+	let start = time(), found = 0, said = false;
 
 	while (true) {
 		let d = derive();
@@ -590,8 +648,12 @@ function startup() {
 				found = 0;
 				start = now;
 			}
-		} else if (now - start >= WAIT) {
+		} else if (WAIT > 0 && now - start >= WAIT) {
 			fail(`no hostapd BSS uses ft_iface=${FT_IF} after ${WAIT}s (set hostapd_bss_options 'ft_iface=${FT_IF}' on the wifi-iface)`);
+		} else if (!WAIT && !said) {
+			// RRB_WAIT=0: no deadline; the FT WLAN may be configured later.
+			log(`waiting for a hostapd BSS on ft_iface=${FT_IF}`);
+			said = true;
 		}
 		sleep(2000);
 	}
@@ -658,6 +720,7 @@ function from_lan(f, hap, lan_if) {
 
 	let apsrc = mac_at(f, 20);
 	remote[apsrc] = true;
+	peer_seen(apsrc, null, 'rrb');
 	let out = substr(f, 26, 6) + substr(f, 20, 6) + substr(f, 12, 8) + substr(f, 32);
 	if (VERBOSE)
 		log(`${lan_if}->hostapd type=${ord(f, 19)} ${apsrc} -> ${apdst} (via ${src})`);
@@ -686,8 +749,23 @@ function from_hostapd(f, lan, lan_if) {
 if (CHECK)
 	check();
 
-for (let e in veth_errors())
-	fail(e);
+if (!WAIT) {
+	// RRB_WAIT=0: the veth pair may be created later too (by whatever
+	// configures the system; openUF does it on its first config push with an
+	// FT WLAN). Wait for it rather than exit for procd to respawn us.
+	let said = false;
+	while (length(veth_errors())) {
+		if (!said) {
+			log(`waiting for the veth pair ${FT_IF}/${PEER_IF}: ${join('; ', veth_errors())}`);
+			said = true;
+		}
+		sleep(5000);
+	}
+} else {
+	for (let e in veth_errors())
+		fail(e);
+}
+peers_load();
 
 let d = startup();
 for (let e in d.errors)
