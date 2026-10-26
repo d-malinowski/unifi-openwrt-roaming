@@ -16,17 +16,22 @@
 #   rrb-unifi-setup confirm            keep a network change (see install)
 #
 # With openUF (a UniFi controller manages the OpenWrt AP), the Wi-Fi sections
-# belong to openUF, which writes the FT settings itself (unifi_ft_interop) and
-# takes the UniFi peers from rrb-unifi's ft_peer list. Then `peers` replaces
-# `apply`, and `verify` checks openUF's sections the same way.
+# belong to openUF. `install` adds the rrb-unifi plugin to openUF (needs openUF
+# with the plugin hook), which writes the FT settings on every push and takes
+# the UniFi peers from rrb-unifi's ft_peer list. Then `peers` replaces `apply`,
+# and `verify` checks the plugin and openUF's sections the same way.
 #
 # Secrets: collected data (it contains the FT key) stays in RAM
 # (/tmp/rrb-unifi-setup, mode 600). Only a SHA-256 of the Wi-Fi password is
 # read from the UniFi AP, never the password itself. Keys are never printed.
 
-VERSION=1.3
+VERSION=1.4
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SRC_DIR=$(dirname "$SELF")
+OUF=/opt/openuf				# openUF's code and conf.lua
+OUF_PLUGIN=/etc/openuf/plugins/rrb-unifi.lua
+OUF_ENABLED=/etc/openuf/plugins.enabled
+PLUGIN_SRC=$SRC_DIR/openuf-plugin/rrb-unifi.lua
 STATE=/etc/rrb-unifi-setup		# backups, original values (persistent)
 DATA=/tmp/rrb-unifi-setup		# collected UniFi data (RAM)
 CONFIRM=/tmp/rrb-unifi-setup.confirmed
@@ -81,6 +86,83 @@ pkg_remove() {
 	else opkg remove "$@"; fi
 }
 
+# ---------------------------------------------------------------- openUF plugin
+
+has_openuf() { [ -f "$OUF/inform.lua" ]; }
+# The api number of openUF's plugin hook; empty when openUF has none
+ouf_api() { sed -n 's/^M\.API *= *\([0-9][0-9]*\).*/\1/p' "$OUF/plugins.lua" 2>/dev/null | head -1; }
+# An older openUF fork with this plugin's code built in (unifi_ft_interop), switched on
+ouf_old_module() { [ -f "$OUF/ftinterop.lua" ] && grep -qE '^[[:space:]]*unifi_ft_interop[[:space:]]*=[[:space:]]*true' "$OUF/conf.lua" 2>/dev/null; }
+plugin_listed() { sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$OUF_ENABLED" 2>/dev/null | grep -qxF rrb-unifi; }
+# conf.lua's own list: the user's file, only read here
+plugin_in_conf() { grep -qE "^[[:space:]]*plugins[[:space:]]*=.*[\"']rrb-unifi[\"']" "$OUF/conf.lua" 2>/dev/null; }
+
+# Copy the plugin into openUF and enable it; openUF restart on a change
+install_plugin() {
+	has_openuf || return 0
+	api=$(ouf_api)	# cmd_install checked it: 1, or none with the built-in module on
+	if [ "$api" != 1 ]; then
+		say "openUF here has no plugin hook; its built-in unifi_ft_interop stays in charge."
+		say "The plugin is installed now and takes over once openUF has the hook (8287ecf or later)."
+	elif ouf_old_module; then
+		say "WARNING: openUF's built-in unifi_ft_interop is on as well, and both write the same options."
+		say "         Remove unifi_ft_interop from $OUF/conf.lua (this tool never edits that file)."
+	fi
+	changed=0
+	if ! cmp -s "$PLUGIN_SRC" "$OUF_PLUGIN"; then
+		mkdir -p "$(dirname "$OUF_PLUGIN")"
+		cp "$PLUGIN_SRC" "$OUF_PLUGIN"
+		say "openUF plugin: $OUF_PLUGIN"; changed=1
+	fi
+	if ! plugin_listed && ! plugin_in_conf; then
+		[ -s "$OUF_ENABLED" ] && [ -n "$(tail -c1 "$OUF_ENABLED")" ] && echo >> "$OUF_ENABLED"
+		echo rrb-unifi >> "$OUF_ENABLED"
+		say "openUF plugin enabled in $OUF_ENABLED"; changed=1
+	fi
+	[ $changed = 1 ] || { say "openUF plugin: installed and enabled"; return 0; }
+	[ "$api" = 1 ] || return 0
+	if ask "Restart openUF so the controller pushes the Wi-Fi settings again?"; then
+		/etc/init.d/openuf restart
+		say "openUF restarted: the controller pushes again within a few informs"
+		say "(Force Provision, or renaming the AP in UniFi, makes it immediate)."
+	else
+		say "Takes effect after: /etc/init.d/openuf restart"
+	fi
+}
+
+# openUF sections that still point hostapd at the translator's veth
+ouf_ft_secs() {
+	for s in $(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p"); do
+		is_openuf "$s" && echo "$s"
+	done
+}
+wait_ouf_clean() {	# wait_ouf_clean SECONDS -> 0 once no openUF section uses the veth
+	n=0
+	while [ -n "$(ouf_ft_secs)" ]; do
+		[ $n -ge "$1" ] && return 1
+		sleep 5; n=$((n + 5))
+	done
+	return 0
+}
+
+# Take the plugin out of openUF, then wait for the re-push that drops ft_iface:
+# the veth must outlive every hostapd BSS that uses it.
+uninstall_plugin() {
+	plugin_in_conf && die "$OUF/conf.lua lists rrb-unifi in config.plugins: remove it there first (this tool never edits conf.lua)"
+	ouf_old_module && die "openUF's built-in unifi_ft_interop is on: set it to false in $OUF/conf.lua, restart openUF and Force Provision first"
+	if plugin_listed; then
+		say "openUF plugin rrb-unifi is enabled; openUF must drop its options before the translator goes."
+		ask "Disable the plugin and restart openUF (the controller then pushes the Wi-Fi settings again)?" || die "cancelled"
+		sed -i '/^[[:space:]]*rrb-unifi[[:space:]]*\(#.*\)\{0,1\}$/d' "$OUF_ENABLED"
+		/etc/init.d/openuf restart
+	fi
+	[ -n "$(ouf_ft_secs)" ] || return 0
+	say "Waiting for openUF's push to remove ft_iface=$(ft_if) from: $(echo $(ouf_ft_secs))"
+	wait_ouf_clean 180 && return 0
+	say "No push yet. Force Provision the AP in UniFi now (or rename it, which also pushes)."
+	wait_ouf_clean 300 || die "openUF's sections still use ft_iface=$(ft_if); nothing else was removed. Run uninstall again after the push"
+}
+
 # ---------------------------------------------------------------- network change with watchdog
 
 # Apply a network config change and reload; if it isn't confirmed within
@@ -123,6 +205,13 @@ cmd_install() {
 	for f in rrb-unifi.uc rrb-unifi.init rrb-unifi.config; do
 		[ -f "$SRC_DIR/$f" ] || die "$f not found next to this script ($SRC_DIR)"
 	done
+	if has_openuf; then
+		[ -f "$PLUGIN_SRC" ] || die "openuf-plugin/rrb-unifi.lua not found next to this script ($SRC_DIR)"
+		api=$(ouf_api)
+		[ "$api" = 1 ] || { [ -z "$api" ] && ouf_old_module; } \
+			|| die "openUF without a matching plugin hook (api ${api:-none}; needs api 1, openUF 8287ecf or later); update openUF first"
+		say "openUF: found, plugin hook api ${api:-none (built-in unifi_ft_interop)}"
+	fi
 
 	need=""
 	for p in $PKGS; do pkg_installed "$p" || need="$need $p"; done
@@ -145,7 +234,8 @@ cmd_install() {
 	for f in /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi /etc/rc.d/S99rrb-unifi /usr/sbin/rrb-unifi-setup; do
 		grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 	done
-	say "Files installed, service enabled (starts after 'apply')"
+	if has_openuf; then say "Files installed, service enabled"
+	else say "Files installed, service enabled (starts after 'apply')"; fi
 
 	ft=$(ft_if); peer=$(peer_if)
 	if [ -e "/sys/class/net/$ft" ] && [ -e "/sys/class/net/$peer" ]; then
@@ -162,6 +252,8 @@ cmd_install() {
 			n=0; while [ $n -lt 20 ] && ! [ -e "/sys/class/net/$peer" ]; do sleep 1; n=$((n + 1)); done
 			[ -e "/sys/class/net/$ft" ] && [ -e "/sys/class/net/$peer" ] || die "veth did not come up"
 			say "veth $ft/$peer: up"
+			install_plugin
+			start_with_openuf
 			say "Next: rrb-unifi-setup verify (hostapd may need a Wi-Fi restart now that $ft exists)"
 			return 0
 		fi
@@ -187,7 +279,20 @@ cmd_install() {
 		[ -e "/sys/class/net/$ft" ] && [ -e "/sys/class/net/$peer" ] || die "veth did not come up"
 		say "veth $ft/$peer: up"
 	fi
+	install_plugin
+	start_with_openuf
 	say "Next: rrb-unifi-setup collect USER@UNIFI_IP"
+	has_openuf && say "      then verify, peers, and Force Provision the AP in UniFi"
+}
+
+# Without openUF, 'apply' starts the translator once the Wi-Fi is configured.
+# With openUF there is no 'apply' (openUF writes the Wi-Fi settings), so start
+# it here; it waits for hostapd to use the veth.
+start_with_openuf() {
+	has_openuf || return 0
+	/etc/init.d/rrb-unifi running && return 0
+	/etc/init.d/rrb-unifi start
+	say "Translator started (openUF provisions the Wi-Fi settings)"
 }
 
 # ---------------------------------------------------------------- collect (UniFi side, read-only)
@@ -342,7 +447,7 @@ check_section() {	# check_section SECTION
 	if is_openuf "$s"; then
 		say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}, provisioned by openUF):"
 		# apply can't fix these: openUF rewrites the section on every push
-		SFIX() { FAIL "$* (written by openUF: check unifi_ft_interop, run 'rrb-unifi-setup peers', then Force Provision)"; }
+		SFIX() { FAIL "$* (written by openUF: check the openUF plugin below, run 'rrb-unifi-setup peers', then Force Provision)"; }
 	else
 		say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}):"
 		SFIX() { FIX "$@"; }
@@ -434,12 +539,43 @@ check_peers() {	# openUF mode: rrb-unifi's ft_peer list = the UniFi BSSes
 	else FIX "ft_peer: $(echo ${have:-<none>}) -> $(echo $want)"; fi
 }
 
+check_plugin() {	# openUF mode: the plugin that writes the FT options
+	say "openUF plugin:"
+	api=$(ouf_api)
+	if [ "$api" = 1 ]; then
+		OK "openUF plugin hook, api 1"
+	elif [ -z "$api" ] && ouf_old_module; then
+		WARN "openUF has no plugin hook; its built-in unifi_ft_interop writes the FT options"
+		return
+	else
+		FAIL "openUF plugin hook: api ${api:-none}, needs api 1 (openUF 8287ecf or later)"
+		return
+	fi
+	ouf_old_module && WARN "openUF's built-in unifi_ft_interop is on too: remove it from $OUF/conf.lua"
+	if [ ! -f "$OUF_PLUGIN" ]; then
+		FAIL "$OUF_PLUGIN missing (run install)"
+	elif [ -f "$PLUGIN_SRC" ] && [ "$SRC_DIR" != /usr/sbin ]; then
+		cmp -s "$PLUGIN_SRC" "$OUF_PLUGIN" && OK "$OUF_PLUGIN, same as $SRC_DIR" \
+			|| WARN "$OUF_PLUGIN differs from $SRC_DIR (run install to update)"
+	else
+		OK "$OUF_PLUGIN"
+	fi
+	if plugin_listed; then OK "enabled in $OUF_ENABLED"
+	elif plugin_in_conf; then OK "enabled in $OUF/conf.lua"
+	else FAIL "not enabled (run install)"; fi
+	# A plugin that fails is skipped and the WLAN pushed with openUF's own
+	# values; the running hostapd check below shows whether that happened.
+	last=$(logread 2>/dev/null | grep -E 'openuf: plugin rrb-unifi: (not loaded|skipped)' | tail -1)
+	[ -z "$last" ] && OK "no plugin errors in the system log" \
+		|| WARN "system log, $(echo "$last" | cut -c5-19): $(echo "$last" | sed 's/.*openuf: plugin //' | cut -c1-160) (an old line if the running checks below pass)"
+}
+
 cmd_verify() {
 	[ -n "$U_KEY" ] || load_unifi
 	check_unifi
 	for s in $(owrt_sections "$SSID"); do check_section "$s"; done
 	[ -n "$(owrt_sections "$SSID")" ] || FAIL "no enabled OpenWrt AP interface with SSID '$SSID'"
-	openuf_mode && check_peers
+	openuf_mode && { check_plugin; check_peers; }
 	check_system
 	[ $fix -eq 0 ] && [ $fail -eq 0 ] && check_running
 	say ""
@@ -530,8 +666,11 @@ cmd_peers() {
 
 cmd_uninstall() {
 	say "== rrb-unifi-setup: uninstall"
-	for s in $(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p"); do
-		is_openuf "$s" && die "'$s' is provisioned by openUF, which would put ft_iface back; take the AP out of openUF first (Forget it in UniFi while openUF runs)"
+	if has_openuf && { plugin_listed || plugin_in_conf || ouf_old_module || [ -n "$(ouf_ft_secs)" ]; }; then
+		uninstall_plugin
+	fi
+	for s in $(ouf_ft_secs); do
+		die "'$s' is provisioned by openUF and still uses ft_iface=$(ft_if); Force Provision the AP, then run uninstall again"
 	done
 	secs=$(uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.hostapd_bss_options=.*ft_iface=$(ft_if).*/\1/p")
 	say "Wi-Fi interfaces using the translator: $(echo ${secs:-none})"
@@ -574,6 +713,8 @@ cmd_uninstall() {
 	fi
 
 	rm -f /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi /etc/config/rrb-unifi
+	# last: nothing enables it any more (uninstall_plugin)
+	[ -f "$OUF_PLUGIN" ] && rm -f "$OUF_PLUGIN" && say "openUF plugin removed"
 	sed -i '/^\/usr\/sbin\/rrb-unifi\.uc$/d; /^\/etc\/init\.d\/rrb-unifi$/d; /^\/etc\/rc\.d\/S99rrb-unifi$/d; /^\/usr\/sbin\/rrb-unifi-setup$/d' /etc/sysupgrade.conf
 	if [ $RMPKG = 1 ]; then
 		pkg_remove $PKGS && rm -f "$STATE/installed-packages"
