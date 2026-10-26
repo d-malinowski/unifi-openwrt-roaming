@@ -185,7 +185,9 @@ Key translation works as before.
 | `rrb-unifi.uc` | `/usr/sbin/rrb-unifi.uc` | The translator daemon (ucode). Converts RRB-OUI frames between hostapd's private veth link and the LAN, adding or removing UniFi's 12-byte header, and sends and receives UniFi's roam announcements. |
 | `rrb-unifi.init` | `/etc/init.d/rrb-unifi` | procd init script. Starts the translator at boot, restarts it if it stops, and restarts it when the wireless or network config changes. `/etc/init.d/rrb-unifi check` shows what it derives from the running config. |
 | `rrb-unifi.config` | `/etc/config/rrb-unifi` | Optional settings: verbose logging, veth names, LAN interface override, roam announcements on/off. All have defaults. |
-| `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values, or, with openUF, writes the UniFi peer list openUF needs. Also uninstalls. |
+| `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values, or, with openUF, installs the openUF plugin and writes the UniFi peer list it needs. Also uninstalls. |
+| `openuf-plugin/rrb-unifi.lua` | `/etc/openuf/plugins/rrb-unifi.lua` | Only with openUF: the plugin that makes openUF write the fast-roaming settings UniFi APs need. See [With openUF](#with-openuf). |
+| `tests/` | (runs on a PC) | Lua tests for the openUF plugin: `lua tests/run.lua`, plus contract tests against an openUF checkout. |
 | `tools/rrb-decrypt.py` | (runs on a PC) | Diagnostic tool. Decrypts captured RRB-OUI frames with your r0kh/r1kh key and shows which format each AP uses. Optional; not needed for normal use. |
 | `LICENSE` | | GNU General Public License v3.0. |
 
@@ -212,6 +214,8 @@ What was tested on which version:
 | Firmware upgrade with the project installed | 24.10.4 to 25.12.6, see [After a firmware upgrade](#after-a-firmware-upgrade) | |
 | With openUF: `collect`, `verify`, `peers`, walk tests | no | yes, adopted into a UCG Ultra |
 | Roam announcements (1.3), walk tests | no | yes, with openUF |
+| openUF plugin (1.4): upgrade from 1.3's openUF fork, re-push, walk tests both ways | no | yes, adopted into a UCG Ultra (openUF `8287ecf` with local changes outside the plugin hook) |
+| openUF plugin (1.4): `verify`, `uninstall`, install after openUF, failure cases | no | on an x86 VM only (simulated radios, no real roam) |
 
 Not tested yet:
 
@@ -221,8 +225,10 @@ Not tested yet:
 - more than one UniFi AP, `--ssid`
 - WPA3/SAE, 802.11w, other UniFi models, other OpenWrt devices
 - several OpenWrt APs with the translator
-- with openUF: `uninstall`, and installing the translator after openUF
-  (it was installed before)
+- with openUF on real hardware: `verify` and `uninstall` of 1.4, and
+  installing the translator after openUF (tested on the VM only, see the
+  table); `uninstall`'s Force Provision fallback (the push always came
+  within seconds)
 
 Reports are welcome.
 
@@ -403,21 +409,44 @@ session within 120 seconds with `rrb-unifi-setup confirm`, or it is restored.
 [openUF](https://github.com/jonasevcik/openUF) makes an OpenWrt AP show up in
 the UniFi controller as a UniFi AP, so you manage its Wi-Fi from UniFi. Then
 openUF owns the Wi-Fi sections and rewrites them on every config push, so
-`apply` must not touch them. Instead, openUF writes the fast-roaming settings
-itself when its `unifi_ft_interop` option is on, and takes the list of UniFi
-APs from this project's `/etc/config/rrb-unifi`.
+`apply` must not touch them. Instead, a small openUF plugin from this project
+(`openuf-plugin/rrb-unifi.lua`) adds the fast-roaming settings UniFi APs need
+to every push, and takes the list of UniFi APs from `/etc/config/rrb-unifi`.
 
-`unifi_ft_interop` is proposed upstream and not merged yet. Until then it is on
-the `pr/unifi-ft-interop` branch of
-[d-malinowski/openUF](https://github.com/d-malinowski/openUF/tree/pr/unifi-ft-interop).
+It needs openUF with the plugin hook (`/opt/openuf/plugins.lua`, api 1,
+openUF commit `8287ecf` or later); no openUF fork. For each WLAN on which
+openUF turns 802.11r on, the plugin sets:
 
-The steps, tested in this order:
+- the mobility domain UniFi firmware derives from the SSID (the first two
+  bytes of SHA1("salt" + SSID padded to 32 bytes)), instead of openUF's own;
+- `ft_psk_generate_local=0`, `nasid` = the BSSID, and an `r0kh`/`r1kh` entry
+  for every UniFi BSS, keyed with the controller's `iapp_key`;
+- `ft_iface=vft0` in `hostapd_bss_options`, only while the veth exists;
+- no `reassociation_deadline`, so OpenWrt's default applies.
+
+Other WLANs are left alone. If the plugin fails, openUF skips it and pushes the
+WLAN with its own values: Wi-Fi works, fast roaming to UniFi does not.
+`verify` checks the running hostapd config for that reason.
+
+The steps:
 
 1. Install the translator and check it without openUF first, as in
    [Quick install](#quick-install-with-rrb-unifi-setup-recommended)
-   (steps 1 to 5 and the walk tests).
-2. Install openUF and set `unifi_ft_interop = true` in its `conf.lua`. In
-   UniFi, Fast Roaming must be on for the WLAN. Then adopt the AP.
+   (steps 1 to 5 and the walk tests). In UniFi, Fast Roaming must be on for
+   the WLAN.
+2. Install openUF and adopt the AP. Copy the files again, this time with the
+   plugin folder, and run `install` again:
+
+   ```sh
+   scp -O -r rrb-unifi-setup rrb-unifi.uc rrb-unifi.init rrb-unifi.config openuf-plugin root@OPENWRT_IP:/tmp/
+   ssh -t root@OPENWRT_IP sh /tmp/rrb-unifi-setup install
+   ```
+
+   It finds openUF, copies the plugin to `/etc/openuf/plugins/`, adds
+   `rrb-unifi` to `/etc/openuf/plugins.enabled` (it never edits openUF's
+   `conf.lua`) and, after asking, restarts openUF. openUF notices the new
+   plugin and the controller pushes the Wi-Fi settings again within a few
+   informs.
 3. Write the UniFi APs into the peer list:
 
    ```sh
@@ -426,18 +455,27 @@ The steps, tested in this order:
    ```
 
    `peers` shows the list and asks before it writes it. openUF uses it on its
-   next config push: click **Force Provision** for the AP in UniFi.
-4. `rrb-unifi-setup verify` recognises openUF's sections. A wrong value there
-   is reported as `FAIL` with a hint (it can't be fixed by `apply`, because
-   openUF would overwrite it). `apply` refuses to run on them.
+   next config push: click **Force Provision** for the AP in UniFi (where
+   UniFi offers no Force Provision for the AP, renaming it also pushes).
+4. `rrb-unifi-setup verify` recognises openUF's sections and checks the
+   plugin: openUF's hook, the plugin file, its line in `plugins.enabled`, and
+   plugin errors in the system log. A wrong value in openUF's sections is
+   reported as `FAIL` with a hint (`apply` can't fix it, because openUF would
+   overwrite it). `apply` refuses to run on them.
 
 Then do the walk tests again. Run `collect` and `peers` again whenever a UniFi
 AP is added or replaced.
 
-To uninstall the translator, take the AP out of openUF first (Forget it in
-UniFi while openUF runs: openUF then removes its own sections). As long as
-openUF's sections exist, `uninstall` refuses, because openUF would put the
-translator settings back.
+Upgrading from 1.3 with an openUF fork that has `unifi_ft_interop`: install
+1.4 first (the plugin waits while that openUF has no hook), then the upstream
+openUF, and remove `unifi_ft_interop` from `conf.lua`. Both write the same
+settings, so there is no gap.
+
+To uninstall, run `rrb-unifi-setup uninstall`. With openUF it first removes
+`rrb-unifi` from `plugins.enabled`, restarts openUF and waits until openUF's
+next push has taken `ft_iface` out of its sections (if no push comes within
+3 minutes it asks for a Force Provision). Only then does it stop the
+translator and remove the veth, so no hostapd BSS loses its interface.
 
 ### After a firmware upgrade
 
@@ -662,7 +700,10 @@ failed one shows repeated `auth_algo: ft` failures followed by `auth_algo: open`
 On OpenWrt, a fast roam shows as `AP-STA-CONNECTED <client MAC> auth_alg=ft`
 (`logread -e hostapd`); a full login shows `auth_alg=open`. On the HH5A,
 every fast roam is preceded by `nl80211: kernel reports: key addition failed`.
-That message is harmless: the roam completes in the same second.
+That message is harmless and comes from hostapd and mac80211 themselves: hostapd
+tries to install the new key at the FT authentication step, mac80211 refuses keys
+for a station that is not associated yet, and hostapd installs the key again right
+after the reassociation. Any OpenWrt AP with 802.11r logs it.
 
 Turn per-frame logging off again when done:
 
@@ -774,6 +815,21 @@ Then remove the packages if nothing else needs them:
 
 
 ## Changes
+
+### 1.4
+
+- openUF plugin: the openUF side moves out of the openUF fork
+  (`unifi_ft_interop`) into `openuf-plugin/rrb-unifi.lua`, for openUF with
+  the plugin hook (`8287ecf` or later). Same settings as before; it now keys
+  on openUF's own 802.11r decision, so FT turned on only by the WPA3 toggle is
+  covered too, and it keeps any other `hostapd_bss_options` line.
+- Setup tool: `install` installs and enables the plugin when openUF is
+  present, `verify` checks it, and `uninstall` now works with openUF (in the
+  safe order, see [With openUF](#with-openuf)) instead of refusing.
+- Fix: with openUF, `install` now starts the translator. Before, only `apply`
+  started it, and `apply` refuses on openUF's sections, so installing the
+  translator after openUF left it stopped.
+- Tests: `tests/run.lua`, standalone and against an openUF checkout.
 
 ### 1.3
 
