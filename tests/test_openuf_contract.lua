@@ -43,10 +43,11 @@ local function has_log(logged, text)
 end
 
 -- One apply_config run over `vaps` with an in-memory cursor that also holds
--- /etc/config/rrb-unifi. Returns the wireless sections.
-local function run(vaps, cfg)
+-- /etc/config/rrb-unifi, with the optional ft_peer list `peers`. Returns the
+-- wireless sections.
+local function run(vaps, cfg, peers)
 	local db = {["rrb-unifi"] = {main = {[".name"] = "main", [".type"] = "rrb",
-		ft_peer = {PEER1 .. ",00005e005321"}}}}
+		ft_peer = peers}}}
 	local order = {}
 	local c = {}
 	function c:set(config, section, a, b)
@@ -147,12 +148,19 @@ return {
 				assert_eq(s.nasid, "00005e00532b", "nasid from ctx.bssid")
 				assert_nil(s.reassociation_deadline, "DELETE removed openUF's 3000")
 				assert_eq(s.pmk_r1_push, "1", "openUF's push kept")
-				assert_eq(#s.r0kh, 2, "peer + wildcard")
-				assert_eq(s.r0kh[1], PEER1 .. ",00005e005321," .. KEY, "peer from ctx.cursor()")
-				assert_eq(s.r1kh[2], "00:00:00:00:00:00,00:00:00:00:00:00," .. KEY, "r1kh wildcard")
+				assert_eq(#s.r0kh, 1, "r0kh wildcard only")
+				assert_eq(s.r0kh[1], "ff:ff:ff:ff:ff:ff,*," .. KEY, "r0kh wildcard")
+				assert_eq(#s.r1kh, 1, "r1kh wildcard only")
+				assert_eq(s.r1kh[1], "00:00:00:00:00:00,00:00:00:00:00:00," .. KEY, "r1kh wildcard")
 				assert_eq(#s.hostapd_bss_options, 1, "one line")
 				assert_eq(s.hostapd_bss_options[1], "ft_iface=vft0", "veth via ctx.read_file")
 				assert_eq(s.ssid, "corp", "identity untouched")
+
+				s = run({FT_VAP}, {config = {}}, {PEER1 .. ",00005e005321"}).openuf_radio0_corp
+				assert_eq(#logged, 0, "pre-seed: not skipped: " .. tostring(logged[1]))
+				assert_eq(#s.r0kh, 2, "pre-seed: peer + wildcard")
+				assert_eq(s.r0kh[1], PEER1 .. ",00005e005321," .. KEY, "peer from ctx.cursor()")
+				assert_eq(s.r1kh[2], "00:00:00:00:00:00,00:00:00:00:00:00," .. KEY, "r1kh wildcard last")
 			end)
 		end
 	},

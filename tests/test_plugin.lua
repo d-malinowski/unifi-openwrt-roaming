@@ -136,10 +136,9 @@ return {
 		end
 	},
 	{
-		name = "plugin: reproduces the working U7 interop config",
+		name = "plugin: reproduces the working U7 interop config (wildcards only)",
 		fn = function()
-			local ctx = make_ctx({present = {vft0 = true}, bssid = OWN:upper(),
-				db = rrb({PEER2 .. ",00005e005322", PEER1 .. ",00005e005321"})})
+			local ctx, logged = make_ctx({present = {vft0 = true}, bssid = OWN:upper()})
 			local extra = ft_extra()
 			P.vap_options(extra, VAP, ctx)
 			assert_eq(extra.mobility_domain, "5de5", "UniFi mobility domain")
@@ -148,15 +147,31 @@ return {
 			assert_eq(extra.nasid, "00005e00532b", "R0KH-ID = own BSSID")
 			assert_eq(extra.pmk_r1_push, "1", "push untouched")
 			assert_eq(extra.ft_over_ds, "0", "over the air untouched")
+			assert_eq(#extra.r0kh, 1, "r0kh: the wildcard only")
+			assert_eq(extra.r0kh[1], "ff:ff:ff:ff:ff:ff,*," .. KEY, "r0kh wildcard")
+			assert_eq(#extra.r1kh, 1, "r1kh: the wildcard only")
+			assert_eq(extra.r1kh[1], "00:00:00:00:00:00,00:00:00:00:00:00," .. KEY, "r1kh wildcard")
+			assert_eq(type(extra.hostapd_bss_options), "table", "list option")
+			assert_eq(#extra.hostapd_bss_options, 1, "one line")
+			assert_eq(extra.hostapd_bss_options[1], "ft_iface=vft0", "hostapd on the veth")
+			assert_eq(#logged, 0, "the normal case logs nothing")
+		end
+	},
+	{
+		name = "plugin: an optional ft_peer list pre-seeds explicit key holders",
+		fn = function()
+			local ctx, logged = make_ctx({present = {vft0 = true}, bssid = OWN,
+				db = rrb({PEER2 .. ",00005e005322", PEER1 .. ",00005e005321"})})
+			local extra = ft_extra()
+			P.vap_options(extra, VAP, ctx)
 			assert_eq(#extra.r0kh, 3, "two peers + wildcard")
 			assert_eq(extra.r0kh[1], PEER2 .. ",00005e005322," .. KEY, "peer order kept")
 			assert_eq(extra.r0kh[2], PEER1 .. ",00005e005321," .. KEY, "second peer")
 			assert_eq(extra.r0kh[3], "ff:ff:ff:ff:ff:ff,*," .. KEY, "wildcard last")
+			assert_eq(#extra.r1kh, 3, "r1kh: two peers + wildcard")
 			assert_eq(extra.r1kh[1], PEER2 .. "," .. PEER2 .. "," .. KEY, "r1kh peer")
 			assert_eq(extra.r1kh[3], "00:00:00:00:00:00,00:00:00:00:00:00," .. KEY, "r1kh wildcard")
-			assert_eq(type(extra.hostapd_bss_options), "table", "list option")
-			assert_eq(#extra.hostapd_bss_options, 1, "one line")
-			assert_eq(extra.hostapd_bss_options[1], "ft_iface=vft0", "hostapd on the veth")
+			assert_eq(#logged, 0, "a valid list logs nothing")
 		end
 	},
 	{
@@ -202,7 +217,7 @@ return {
 		end
 	},
 	{
-		name = "plugin: degrades without key, peers, BSSID or veth",
+		name = "plugin: degrades without key, BSSID or veth",
 		fn = function()
 			local ctx, logged = make_ctx()
 			local extra = {ieee80211r = "1"}
@@ -214,12 +229,6 @@ return {
 			assert_true(has_log(logged, "iapp_key"), "missing key logged")
 			assert_true(has_log(logged, "BSSID not known"), "missing BSSID logged")
 			assert_true(has_log(logged, "ft_iface not present"), "missing veth logged")
-
-			ctx, logged = make_ctx({present = {vft0 = true}, bssid = OWN})
-			extra = ft_extra()
-			P.vap_options(extra, VAP, ctx)
-			assert_eq(#extra.r0kh, 1, "wildcard only")
-			assert_true(has_log(logged, "no ft_peer"), "missing peers logged")
 		end
 	},
 	{

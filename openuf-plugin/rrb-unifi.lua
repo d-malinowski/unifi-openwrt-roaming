@@ -31,11 +31,14 @@
 	    gets no answer.
 	  * nasid = this BSS's BSSID without colons, the same R0KH-ID convention
 	    UniFi firmware uses ($bssid). OpenWrt sets none.
-	  * explicit key holders for every UniFi peer BSS, listed by
-	    `rrb-unifi-setup peers` in /etc/config/rrb-unifi
-	    (`list ft_peer '<bssid>,<r0kh-id>'`), keyed with the controller's
-	    iapp_key. pmk_r1_push skips wildcard entries, so a peer only gets
-	    pushes when it is listed.
+	  * wildcard key holders (r0kh ff:ff:ff:ff:ff:ff,*; r1kh 00:..:00,00:..:00),
+	    keyed with the controller's iapp_key, the same two entries UniFi
+	    firmware writes. hostapd learns each UniFi peer BSS from its first
+	    pull or answer (after a sequence-number round trip) and then pushes
+	    keys to it as well; a BSS reload forgets the learned peers. Optional
+	    pre-seed: peers listed in /etc/config/rrb-unifi
+	    (`list ft_peer '<bssid>,<r0kh-id>'`) get explicit entries before the
+	    wildcards, so they get pushes from the first login on.
 
 	And hostapd's ft_iface, added to hostapd_bss_options only when the
 	translator's veth end exists: an ft_iface that does not exist makes
@@ -128,9 +131,10 @@ end
 
 -- ─── translator config ───────────────────────────────────────────────────────
 
--- The UniFi peer BSSes from /etc/config/rrb-unifi, as
--- {{bssid = "aa:bb:..", r0kh_id = "aabb.."}, ...}. Malformed entries are
--- dropped with a log line rather than written into hostapd's config.
+-- The optional pre-seeded UniFi peer BSSes from /etc/config/rrb-unifi, as
+-- {{bssid = "aa:bb:..", r0kh_id = "aabb.."}, ...}; usually none. Malformed
+-- entries are dropped with a log line rather than written into hostapd's
+-- config.
 function M.peers(cursor, ctx)
 	local raw = cursor and cursor:get(M.RRB_CONFIG, "main", "ft_peer")
 	if type(raw) == "string" then raw = {raw} end
@@ -213,10 +217,6 @@ function M.vap_options(extra, vap, ctx)
 		r0kh[#r0kh + 1] = "ff:ff:ff:ff:ff:ff,*," .. key
 		r1kh[#r1kh + 1] = "00:00:00:00:00:00,00:00:00:00:00:00," .. key
 		extra.r0kh, extra.r1kh = r0kh, r1kh
-		if #r0kh == 1 then
-			ctx.log("no ft_peer in /etc/config/" .. M.RRB_CONFIG
-				.. ": UniFi peers can pull keys, but none get pushed")
-		end
 	else
 		-- Without the controller's key OpenWrt derives one from the
 		-- passphrase, which no UniFi AP shares.
