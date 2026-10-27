@@ -130,9 +130,22 @@ messages. It doesn't poll anything while running.
 
 Both FT key distribution modes then work:
 
-- pull: OpenWrt asks UniFi for the key (client first connected to UniFi)
+- pull: the AP a client roams to asks the AP of the client's first login for
+  the key, in both directions
 - push: OpenWrt sends the key to UniFi right after the client's first login
   on OpenWrt, so the UniFi AP already has it when the client roams
+
+No AP needs a list of the others. Both sides have only the two wildcard key
+holders (`r0kh=ff:ff:ff:ff:ff:ff *` and `r1kh=00:00:00:00:00:00
+00:00:00:00:00:00`, keyed with the WLAN's FT key), which is what UniFi
+firmware itself writes. An AP that doesn't know where a key is sends its pull
+to all APs, and the one that has the key answers. hostapd learns every peer
+BSS from such a first exchange (after a sequence-number round trip), sends
+later pulls straight to it, and pushes keys to it after each new login. A
+UniFi AP added later or replaced is found the same way. What this costs: the
+first exchange with each peer BSS is a few messages more, within the client's
+FT authentication (well under a second in the tests), and every hostapd BSS
+restart forgets the learned peers, so this happens again after each one.
 
 
 ## Roam announcements
@@ -185,7 +198,7 @@ Key translation works as before.
 | `rrb-unifi.uc` | `/usr/sbin/rrb-unifi.uc` | The translator daemon (ucode). Converts RRB-OUI frames between hostapd's private veth link and the LAN, adding or removing UniFi's 12-byte header, and sends and receives UniFi's roam announcements. |
 | `rrb-unifi.init` | `/etc/init.d/rrb-unifi` | procd init script. Starts the translator at boot, restarts it if it stops, and restarts it when the wireless or network config changes. `/etc/init.d/rrb-unifi check` shows what it derives from the running config. |
 | `rrb-unifi.config` | `/etc/config/rrb-unifi` | Optional settings: verbose logging, veth names, LAN interface override, roam announcements on/off. All have defaults. |
-| `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values, or, with openUF, installs the openUF plugin and writes the UniFi peer list it needs. Also uninstalls. |
+| `rrb-unifi-setup` | `/usr/sbin/rrb-unifi-setup` | Setup tool (shell). Installs everything, reads the 802.11r settings from the UniFi AP, checks both sides against each other and configures OpenWrt from the UniFi values, or, with openUF, installs the openUF plugin and checks it without any login to a UniFi AP. Also uninstalls. |
 | `openuf-plugin/rrb-unifi.lua` | `/etc/openuf/plugins/rrb-unifi.lua` | Only with openUF: the plugin that makes openUF write the fast-roaming settings UniFi APs need. See [With openUF](#with-openuf). |
 | `tests/` | (runs on a PC) | Lua tests for the openUF plugin: `lua tests/run.lua`, plus contract tests against an openUF checkout. |
 | `tools/rrb-decrypt.py` | (runs on a PC) | Diagnostic tool. Decrypts captured RRB-OUI frames with your r0kh/r1kh key and shows which format each AP uses. Optional; not needed for normal use. |
@@ -216,19 +229,20 @@ What was tested on which version:
 | Roam announcements (1.3), walk tests | no | yes, with openUF |
 | openUF plugin (1.4): upgrade from 1.3's openUF fork, re-push, walk tests both ways | no | yes, adopted into a UCG Ultra (openUF `8287ecf` with local changes outside the plugin hook) |
 | openUF plugin (1.4): `verify`, `uninstall`, install after openUF, failure cases | no | on an x86 VM only (simulated radios, no real roam) |
+| Wildcard key holders only (the 1.5 config, set by hand on 1.4): first contact, push to learned peers, pulls both ways, both bands, after a BSS restart | no | yes, with openUF |
+| 1.5 with openUF: install over 1.4, `verify` without UniFi data and with collected data, old `ft_peer` list, `uninstall` incl. its Force Provision wait, reinstall | no | on an x86 VM only |
+| 1.5 without openUF: `verify` and `apply --ssid` (wildcards, kept and removed explicit entries) | no | on an x86 VM only, made-up UniFi data |
 
 Not tested yet:
 
 - the setup tool's interactive prompts (the tests used `--yes`), and the
   automatic network restore actually firing
 - the basic wpad variant (`wpad-basic-*`)
-- more than one UniFi AP, `--ssid`
+- more than one UniFi AP
 - WPA3/SAE, 802.11w, other UniFi models, other OpenWrt devices
 - several OpenWrt APs with the translator
-- with openUF on real hardware: `verify` and `uninstall` of 1.4, and
-  installing the translator after openUF (tested on the VM only, see the
-  table); `uninstall`'s Force Provision fallback (the push always came
-  within seconds)
+- with openUF on real hardware: `verify` and `uninstall`, and installing
+  the translator after openUF (tested on the VM only, see the table)
 
 Reports are welcome.
 
@@ -411,7 +425,8 @@ the UniFi controller as a UniFi AP, so you manage its Wi-Fi from UniFi. Then
 openUF owns the Wi-Fi sections and rewrites them on every config push, so
 `apply` must not touch them. Instead, a small openUF plugin from this project
 (`openuf-plugin/rrb-unifi.lua`) adds the fast-roaming settings UniFi APs need
-to every push, and takes the list of UniFi APs from `/etc/config/rrb-unifi`.
+to every push. The controller sends openUF the WLAN's FT key, so nothing has
+to be read from a UniFi AP: no `collect`, no UniFi SSH login.
 
 It needs openUF with the plugin hook (`/opt/openuf/plugins.lua`, api 1,
 openUF commit `8287ecf` or later); no openUF fork. For each WLAN on which
@@ -419,8 +434,9 @@ openUF turns 802.11r on, the plugin sets:
 
 - the mobility domain UniFi firmware derives from the SSID (the first two
   bytes of SHA1("salt" + SSID padded to 32 bytes)), instead of openUF's own;
-- `ft_psk_generate_local=0`, `nasid` = the BSSID, and an `r0kh`/`r1kh` entry
-  for every UniFi BSS, keyed with the controller's `iapp_key`;
+- `ft_psk_generate_local=0`, `nasid` = the BSSID, and the wildcard
+  `r0kh`/`r1kh` entries keyed with the controller's `iapp_key` (see
+  [How it works](#how-it-works): hostapd learns the UniFi peers);
 - `ft_iface=vft0` in `hostapd_bss_options`, only while the veth exists;
 - no `reassociation_deadline`, so OpenWrt's default applies.
 
@@ -430,44 +446,54 @@ WLAN with its own values: Wi-Fi works, fast roaming to UniFi does not.
 
 The steps:
 
-1. Install the translator and check it without openUF first, as in
-   [Quick install](#quick-install-with-rrb-unifi-setup-recommended)
-   (steps 1 to 5 and the walk tests). In UniFi, Fast Roaming must be on for
+1. Install openUF and adopt the AP. In UniFi, Fast Roaming must be on for
    the WLAN.
-2. Install openUF and adopt the AP. Copy the files again, this time with the
-   plugin folder, and run `install` again:
+2. Copy the files with the plugin folder to the AP and run `install`:
 
    ```sh
    scp -O -r rrb-unifi-setup rrb-unifi.uc rrb-unifi.init rrb-unifi.config openuf-plugin root@OPENWRT_IP:/tmp/
    ssh -t root@OPENWRT_IP sh /tmp/rrb-unifi-setup install
    ```
 
-   It finds openUF, copies the plugin to `/etc/openuf/plugins/`, adds
+   It installs the packages, the translator and the veth pair as in
+   [Quick install](#quick-install-with-rrb-unifi-setup-recommended) step 2,
+   finds openUF, copies the plugin to `/etc/openuf/plugins/`, adds
    `rrb-unifi` to `/etc/openuf/plugins.enabled` (it never edits openUF's
    `conf.lua`) and, after asking, restarts openUF. openUF notices the new
    plugin and the controller pushes the Wi-Fi settings again within a few
-   informs.
-3. Write the UniFi APs into the peer list:
+   informs. To push at once, click **Force Provision** for the AP in UniFi
+   (where UniFi offers no Force Provision for the AP, renaming it also pushes).
+3. After the push, check:
 
    ```sh
-   rrb-unifi-setup collect USER@UNIFI_IP
-   rrb-unifi-setup peers
+   rrb-unifi-setup verify
    ```
 
-   `peers` shows the list and asks before it writes it. openUF uses it on its
-   next config push: click **Force Provision** for the AP in UniFi (where
-   UniFi offers no Force Provision for the AP, renaming it also pushes).
-4. `rrb-unifi-setup verify` recognises openUF's sections and checks the
-   plugin: openUF's hook, the plugin file, its line in `plugins.enabled`, and
-   plugin errors in the system log. A wrong value in openUF's sections is
-   reported as `FAIL` with a hint (`apply` can't fix it, because openUF would
-   overwrite it). `apply` refuses to run on them.
+   It recognises openUF's sections and checks the FT settings in them against
+   the controller's values (the key from the wildcard entry, the mobility
+   domain derived from the SSID), the plugin (openUF's hook, the plugin file,
+   its line in `plugins.enabled`, plugin errors in the system log), the
+   running hostapd config and the translator. A wrong value in openUF's
+   sections is reported as `FAIL` with a hint (`apply` can't fix it, because
+   openUF would overwrite it). `apply` refuses to run on them.
 
-Then do the walk tests again. Run `collect` and `peers` again whenever a UniFi
-AP is added or replaced.
+   Optional: after `rrb-unifi-setup collect USER@UNIFI_IP`, `verify` also
+   compares the key, the mobility domain and the Wi-Fi password (as a hash)
+   with that UniFi AP.
+
+Then do the walk tests in [Testing](#testing). A UniFi AP added or replaced
+later needs no step on the OpenWrt AP.
+
+Upgrading from 1.4: run `install` again with the new files. 1.4's `peers`
+wrote the UniFi BSSes into `/etc/config/rrb-unifi` (`list ft_peer`). The
+plugin still honours that list as an optional pre-seed (explicit key holders
+before the wildcards, so those peers get pushes from the first login, not
+only after the first exchange), and `verify` lists it. It isn't needed; to
+drop it, run `uci delete rrb-unifi.main.ft_peer; uci commit rrb-unifi` and
+Force Provision the AP.
 
 Upgrading from 1.3 with an openUF fork that has `unifi_ft_interop`: install
-1.4 first (the plugin waits while that openUF has no hook), then the upstream
+1.5 first (the plugin waits while that openUF has no hook), then the upstream
 openUF, and remove `unifi_ft_interop` from `conf.lua`. Both write the same
 settings, so there is no gap.
 
@@ -489,7 +515,7 @@ restarting it after 5 tries. From a wired connection:
 rrb-unifi-setup install              # reinstalls the packages, recreates the veth
 wifi up                              # starts the BSSes that failed
 /etc/init.d/rrb-unifi restart
-rrb-unifi-setup collect USER@UNIFI_IP   # the collected data was in RAM
+rrb-unifi-setup collect USER@UNIFI_IP   # without openUF: the collected data was in RAM
 rrb-unifi-setup verify
 ```
 
@@ -521,9 +547,9 @@ Note:
 
 - `mobility_domain`, for example `a1b2`
 - the key from the `r0kh=`/`r1kh=` lines (32 hex characters, the same as `iapp_key`)
-- the BSSID of each UniFi radio broadcasting your SSID (`addr` in `iw dev`),
-  for example `02:22:22:22:22:05` and `02:22:22:22:22:02`.
-  `nas_identifier=$bssid` means each radio's R0KH-ID is its BSSID without colons.
+
+The BSSIDs of the UniFi radios are not needed: both sides use wildcard key
+holders and learn each other (see [How it works](#how-it-works)).
 
 ### 2. Install the packages on OpenWrt
 
@@ -582,7 +608,7 @@ chmod +x /usr/sbin/rrb-unifi.uc /etc/init.d/rrb-unifi
 
 ### 5. Configure 802.11r on OpenWrt
 
-Set the first four variables to your values from step 1. The loop finds every
+Set the first three variables to your values from step 1. The loop finds every
 OpenWrt AP interface with your SSID by itself, whatever its section name,
 interface name or radio, and uses its own BSSID as `nasid`.
 
@@ -590,8 +616,6 @@ interface name or radio, and uses its own BSSID as `nasid`.
 SSID='YOUR_SSID'
 KEY=0123456789abcdef0123456789abcdef
 MDID=a1b2
-# every UniFi BSSID broadcasting your SSID, separated by spaces
-UNIFI_BSSIDS='02:22:22:22:22:05 02:22:22:22:22:02'
 
 for s in $(uci show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
   [ "$(uci -q get wireless.$s.ssid)" = "$SSID" ] || continue
@@ -608,12 +632,7 @@ for s in $(uci show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'
   uci set wireless.$s.nasid="$(echo $bssid | tr -d :)"
   uci -q delete wireless.$s.r0kh; uci -q delete wireless.$s.r1kh
   uci -q delete wireless.$s.hostapd_bss_options
-  # one r0kh + r1kh line per UniFi radio (needed for push)
-  for b in $UNIFI_BSSIDS; do
-    uci add_list wireless.$s.r0kh="$b,$(echo $b | tr -d :),$KEY"
-    uci add_list wireless.$s.r1kh="$b,$b,$KEY"
-  done
-  # wildcards, the same as the UniFi side uses
+  # wildcard key holders, the same as the UniFi side uses
   uci add_list wireless.$s.r0kh="ff:ff:ff:ff:ff:ff,*,$KEY"
   uci add_list wireless.$s.r1kh="00:00:00:00:00:00,00:00:00:00:00:00,$KEY"
   # send inter-AP messages through the translator
@@ -678,22 +697,27 @@ logread -f -e rrb-unifi
 ```
 
 1. Next to the OpenWrt AP, turn the client's Wi-Fi off and on, then walk to
-   the UniFi AP. You should see push messages (`type=3`, one per UniFi radio)
-   right after the login, and a fast roam.
+   the UniFi AP. The first time after a hostapd start, the UniFi AP pulls the
+   key (`type=1` in, sequence messages `type=4`/`type=5`, `type=2` out), and
+   the OpenWrt AP learns that UniFi BSS. From then on, each new login on the
+   OpenWrt AP is followed by a push to it (`type=3`). Either way: a fast roam.
 2. Next to the UniFi AP, turn Wi-Fi off and on, then walk to the OpenWrt AP.
    You should see a pull (`type=1` out, `type=2` in) and a fast roam. The
-   first exchange after a restart is preceded by sequence messages
+   first pull to a UniFi AP goes to all APs (`-> ff:ff:ff:ff:ff:ff`), later
+   ones straight to it. The first exchange is preceded by sequence messages
    (`type=4`, `type=5`).
 
 Message types: 1 pull, 2 pull response, 3 push, 4 sequence request,
 5 sequence response.
 
-If test 2 shows a fast roam but no pull, the OpenWrt AP already had the key.
-With a Wi-Fi password (FT-PSK) the roaming key has no random part: turning
-Wi-Fi off and on gives the same key, and hostapd keeps keys it fetched for
-days. To see a real pull, empty that cache by restarting hostapd on OpenWrt
-(`wifi down; wifi up`, or a reboot), then repeat test 2. A plain `wifi reload`
-does nothing when the config hasn't changed.
+If a test shows a fast roam but no messages at all, the AP the client roamed
+to already had the key. With a Wi-Fi password (FT-PSK) the roaming key has no
+random part: turning Wi-Fi off and on gives the same key, and both hostapd
+and UniFi keep keys they received for days. To see real messages, use a
+client address the target AP has never seen (switch the phone between its
+randomized and its device MAC for this network), or, for test 2, empty the
+OpenWrt AP's cache by restarting hostapd (`wifi down; wifi up`, or a reboot).
+A plain `wifi reload` does nothing when the config hasn't changed.
 
 On the UniFi AP, a fast roam shows as `"auth_algo": "ft"` in `logread`. A
 failed one shows repeated `auth_algo: ft` failures followed by `auth_algo: open`.
@@ -747,9 +771,14 @@ uci set rrb-unifi.main.verbose='0' && uci commit rrb-unifi && /etc/init.d/rrb-un
 
 - If you recreate the SSID in UniFi, its FT key may change. Update `KEY` on
   OpenWrt (rerun step 5).
-- If UniFi BSSIDs change (new SSIDs, radio changes) or you add another UniFi
-  AP, add its BSSIDs to the `r0kh`/`r1kh` lists (rerun step 5). The
-  translator itself needs no changes.
+- New or replaced UniFi APs and changed UniFi BSSIDs need nothing on the
+  OpenWrt AP: hostapd learns them (see [How it works](#how-it-works)).
+- A client whose last full login was on an OpenWrt BSS that has restarted
+  since (a config push that changes it, `wifi up`, a reboot) can't fast-roam
+  back to that BSS: the key of that login was in hostapd's memory and is gone.
+  The roam fails once and the client logs in fully. This happens with or
+  without the translator. Some phones (seen on Samsung Galaxy S20 and S24)
+  can then stay without a usable connection until Wi-Fi is turned off and on.
 - After changing the wireless config by hand with `wifi reload`, run
   `/etc/init.d/rrb-unifi restart` if BSSIDs or the network changed. Changes
   applied with LuCI (or `reload_config`) restart it automatically.
@@ -815,6 +844,24 @@ Then remove the packages if nothing else needs them:
 
 
 ## Changes
+
+### 1.5
+
+- No peer list any more: OpenWrt gets only the two wildcard key holders, as
+  UniFi firmware writes them, and hostapd learns every UniFi peer BSS from the
+  first key exchange, then pushes keys to it too (see
+  [How it works](#how-it-works)). New or replaced UniFi APs need nothing on
+  the OpenWrt AP.
+- With openUF: no UniFi login at all. `install`, then `verify`; `verify`
+  checks against the controller's key and the mobility domain derived from
+  the SSID. `collect` is optional there, for extra comparisons. `peers` is
+  gone (the command only explains); an existing `ft_peer` list still works as
+  an optional pre-seed.
+- Without openUF: `collect` is still needed once for the FT key, which only
+  the UniFi side has. `apply` writes the wildcards only, and keeps explicit
+  entries a previous version wrote if they have the right key.
+- openUF plugin: no log line when there is no `ft_peer` list (the normal case
+  now).
 
 ### 1.4
 
