@@ -55,7 +55,6 @@ done
 
 say() { echo "$*"; }
 die() { echo "ERROR: $*" >&2; exit 2; }
-fp() { [ -n "$1" ] && echo "$(echo "$1" | cut -c1-4)..." || echo "-"; }	# key fingerprint
 nocolon() { echo "$1" | tr -d ':' | tr 'A-F' 'a-f'; }
 lower() { echo "$1" | tr 'A-F' 'a-f'; }
 sha() { printf %s "$1" | sha256sum | cut -d' ' -f1; }
@@ -372,7 +371,7 @@ cmd_collect() {
 	mv "$out.tmp" "$out"
 	say "Saved to $out (RAM, mode 600). UniFi BSSes with fast roaming:"
 	unifi_records | while IFS='	' read -r h ssid ifn addr md ftds r0id key pmf akm ph oper; do
-		printf '  %-10s %-16s ssid=%s md=%s key=%s %s\n' "$ifn" "$addr" "$ssid" "$md" "$(fp "$key")" "$oper"
+		printf '  %-10s %-16s ssid=%s md=%s %s\n' "$ifn" "$addr" "$ssid" "$md" "$oper"
 	done
 	say "Next: rrb-unifi-setup verify"
 }
@@ -510,7 +509,7 @@ check_unifi() {
 	say "  BSSIDs: $(echo $U_BSSIDS)"
 	[ $(echo "$U_MD" | wc -l) -eq 1 ] && [ -n "$U_MD" ] && OK "mobility domain $U_MD" || FAIL "UniFi BSSes disagree on the mobility domain: $(echo $U_MD)"
 	[ $(echo "$U_KEY" | wc -l) -eq 1 ] && echo "$U_KEY" | grep -qE '^[0-9a-f]{32}([0-9a-f]{32})?$' \
-		&& OK "FT key $(fp "$U_KEY") (same on all UniFi BSSes)" || FAIL "no single valid FT key in the UniFi r0kh lines"
+		&& OK "FT key valid, the same on all UniFi BSSes" || FAIL "no single valid FT key in the UniFi r0kh lines"
 	md=$(unifi_md "$SSID")
 	[ "$U_MD" = "$md" ] || WARN "UniFi's mobility domain is not $md, the one derived from the SSID (the openUF plugin writes that one)"
 	[ "$U_FTDS" = 0 ] && OK "UniFi ft_over_ds=0" || FAIL "UniFi uses FT over the DS (ft_over_ds=$U_FTDS); only over-the-air FT is supported"
@@ -523,7 +522,7 @@ check_unifi() {
 check_controller() {	# openUF mode without collected data
 	say "UniFi side: no collected data; the controller's values in openUF's sections, SSID '$SSID':"
 	[ $(echo "$U_KEY" | wc -l) -eq 1 ] && echo "$U_KEY" | grep -qE '^[0-9a-f]{32}([0-9a-f]{32})?$' \
-		&& OK "FT key $(fp "$U_KEY") from the controller (wildcard r0kh, same in all sections)" \
+		&& OK "FT key from the controller valid, the same in the wildcard r0kh of all sections" \
 		|| FAIL "no single valid FT key in the wildcard r0kh of openUF's sections (plugin not active, or no iapp_key from the controller?)"
 	say "  mobility domain: $U_MD (UniFi's derivation from the SSID)"
 	say "  (optional: 'rrb-unifi-setup collect USER@UNIFI_IP' also compares key, mobility domain and password with a UniFi AP)"
@@ -577,7 +576,7 @@ check_keys() {	# check_keys SECTION: the options and key holders from desired()
 	s=$1
 	while read -r a b c; do
 		if [ "$a" = list ]; then
-			uci -q get wireless.$s.$b | tr ' ' '\n' | grep -qxF "$c" && OK "$b entry $(echo "$c" | cut -d, -f1-2),$(fp "$U_KEY")" || SFIX "$b entry missing: $(echo "$c" | cut -d, -f1-2),<key>"
+			uci -q get wireless.$s.$b | tr ' ' '\n' | grep -qxF "$c" && OK "$b entry $(echo "$c" | cut -d, -f1-2),<key>" || SFIX "$b entry missing: $(echo "$c" | cut -d, -f1-2),<key>"
 		else
 			cur=$(uci -q get wireless.$s.$a)
 			[ "$cur" = "$b" ] && OK "$a=$b" || SFIX "$a=${cur:-<unset>} -> $b"

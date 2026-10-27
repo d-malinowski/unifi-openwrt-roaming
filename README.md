@@ -862,6 +862,8 @@ Then remove the packages if nothing else needs them:
   entries a previous version wrote if they have the right key.
 - openUF plugin: no log line when there is no `ft_peer` list (the normal case
   now).
+- `collect` and `verify` no longer print the first characters of the FT key:
+  `verify` compares the keys itself and reports only whether they match.
 
 ### 1.4
 
