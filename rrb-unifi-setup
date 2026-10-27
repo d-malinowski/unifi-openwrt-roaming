@@ -2,30 +2,33 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 d-malinowski
 #
-# rrb-unifi-setup: install rrb-unifi on an OpenWrt AP, read the 802.11r
-# settings from the UniFi AP(s), verify that both sides match, and configure
-# OpenWrt from the UniFi values. UniFi is the source of truth; nothing on the
-# UniFi AP is changed (it is only read, over SSH, once per AP).
+# rrb-unifi-setup: install rrb-unifi on an OpenWrt AP, check its 802.11r
+# settings against the UniFi side, and configure OpenWrt from the UniFi
+# values. UniFi is the source of truth; nothing on a UniFi AP is changed.
 #
 #   rrb-unifi-setup install            packages, translator files, veth pair
-#   rrb-unifi-setup collect USER@HOST  read the UniFi AP (asks for its SSH password)
+#   rrb-unifi-setup collect USER@HOST  read a UniFi AP (asks for its SSH password)
 #   rrb-unifi-setup verify [--ssid S]  compare both sides, show what is wrong
 #   rrb-unifi-setup apply  [--ssid S] [--yes]   fix OpenWrt from the UniFi values
-#   rrb-unifi-setup peers  [--ssid S] [--yes]   write the UniFi peer list for openUF
 #   rrb-unifi-setup uninstall [--remove-packages] [--yes]
 #   rrb-unifi-setup confirm            keep a network change (see install)
 #
-# With openUF (a UniFi controller manages the OpenWrt AP), the Wi-Fi sections
-# belong to openUF. `install` adds the rrb-unifi plugin to openUF (needs openUF
-# with the plugin hook), which writes the FT settings on every push and takes
-# the UniFi peers from rrb-unifi's ft_peer list. Then `peers` replaces `apply`,
-# and `verify` checks the plugin and openUF's sections the same way.
+# Both sides use wildcard key holders only, as UniFi firmware does: hostapd
+# learns every UniFi peer BSS from its first key request and pushes keys to it
+# from then on, so no peer list is needed. Without openUF, `collect` reads the
+# FT key and the values to compare from one UniFi AP, over SSH, once.
+#
+# With openUF (a UniFi controller manages the OpenWrt AP), the controller
+# sends the key and the Wi-Fi sections belong to openUF. `install` adds the
+# rrb-unifi plugin to openUF (needs openUF with the plugin hook), which writes
+# the FT settings on every push, and `verify` checks it without any UniFi
+# login. `collect` is optional there: verify then also compares with that AP.
 #
 # Secrets: collected data (it contains the FT key) stays in RAM
 # (/tmp/rrb-unifi-setup, mode 600). Only a SHA-256 of the Wi-Fi password is
 # read from the UniFi AP, never the password itself. Keys are never printed.
 
-VERSION=1.4
+VERSION=1.5
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SRC_DIR=$(dirname "$SELF")
 OUF=/opt/openuf				# openUF's code and conf.lua
@@ -56,6 +59,42 @@ fp() { [ -n "$1" ] && echo "$(echo "$1" | cut -c1-4)..." || echo "-"; }	# key fi
 nocolon() { echo "$1" | tr -d ':' | tr 'A-F' 'a-f'; }
 lower() { echo "$1" | tr 'A-F' 'a-f'; }
 sha() { printf %s "$1" | sha256sum | cut -d' ' -f1; }
+# UniFi firmware's mobility domain for an SSID: the first two bytes of
+# SHA1("salt" + SSID zero-padded to 32 bytes), as the openUF plugin writes it.
+# In ucode: OpenWrt's busybox has no sha1sum, and the translator needs ucode anyway.
+unifi_md() {
+	RRB_SSID="$1" ucode -e '
+	const M = 0xffffffff;
+	function rol(x, n) { return ((x << n) | (x >> (32 - n))) & M; }
+	let s = "salt" + (getenv("RRB_SSID") || "");
+	while (length(s) < 36) s += chr(0);
+	let ml = length(s) * 8;
+	s += chr(0x80);
+	while (length(s) % 64 != 56) s += chr(0);
+	for (let i = 7; i >= 0; i--) s += chr((ml >> (i * 8)) & 0xff);
+	let h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+	for (let c = 0; c < length(s); c += 64) {
+		let w = [];
+		for (let i = 0; i < 16; i++)
+			w[i] = (ord(s, c + 4 * i) << 24) | (ord(s, c + 4 * i + 1) << 16) | (ord(s, c + 4 * i + 2) << 8) | ord(s, c + 4 * i + 3);
+		for (let i = 16; i < 80; i++)
+			w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+		let a = h[0], b = h[1], x = h[2], d = h[3], e = h[4];
+		for (let i = 0; i < 80; i++) {
+			let f, k;
+			if (i < 20) { f = (b & x) | (~b & M & d); k = 0x5A827999; }
+			else if (i < 40) { f = b ^ x ^ d; k = 0x6ED9EBA1; }
+			else if (i < 60) { f = (b & x) | (b & d) | (x & d); k = 0x8F1BBCDC; }
+			else { f = b ^ x ^ d; k = 0xCA62C1D6; }
+			let t = (rol(a, 5) + f + e + k + w[i]) & M;
+			e = d; d = x; x = rol(b, 30); b = a; a = t;
+		}
+		h[0] = (h[0] + a) & M; h[1] = (h[1] + b) & M; h[2] = (h[2] + x) & M;
+		h[3] = (h[3] + d) & M; h[4] = (h[4] + e) & M;
+	}
+	print(sprintf("%04x\n", h[0] >> 16));
+'
+}
 
 ft_if() { uci -q get rrb-unifi.main.ft_iface || echo vft0; }
 peer_if() { uci -q get rrb-unifi.main.peer_iface || echo vft1; }
@@ -281,8 +320,12 @@ cmd_install() {
 	fi
 	install_plugin
 	start_with_openuf
-	say "Next: rrb-unifi-setup collect USER@UNIFI_IP"
-	has_openuf && say "      then verify, peers, and Force Provision the AP in UniFi"
+	if has_openuf; then
+		say "Next: rrb-unifi-setup verify, after the controller's next push"
+		say "      (Force Provision the AP in UniFi, or rename it, to push now)"
+	else
+		say "Next: rrb-unifi-setup collect USER@UNIFI_IP, then verify and apply"
+	fi
 }
 
 # Without openUF, 'apply' starts the translator once the Wi-Fi is configured.
@@ -384,10 +427,10 @@ sec_ifname() { ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.
 is_openuf() { [ -n "$(uci -q get wireless.$1.openuf_wlanconf_id)" ]; }
 openuf_mode() { for s in $(owrt_sections "$SSID"); do is_openuf "$s" && return 0; done; return 1; }
 
-# The ft_peer entries openUF needs: every UniFi BSS of the SSID, "bssid,r0kh-id"
-desired_peers() { for b in $U_BSSIDS; do echo "$b,$(r0id_of "$b")"; done; }
-
-# The values every OpenWrt section must have, derived from the UniFi data
+# The values every OpenWrt section must have, derived from the UniFi data.
+# Key holders: the two wildcards, as on the UniFi side; hostapd learns the
+# peers. Explicit entries with the right key (written by 1.4, or the openUF
+# plugin's optional ft_peer pre-seed) are kept, others are wrong.
 desired() {	# desired SECTION BSSID -> lines "option value" / "list option value"
 	echo "ieee80211r 1"
 	echo "mobility_domain $U_MD"
@@ -395,15 +438,19 @@ desired() {	# desired SECTION BSSID -> lines "option value" / "list option value
 	echo "ft_psk_generate_local 0"
 	echo "pmk_r1_push 1"
 	echo "nasid $(nocolon "$2")"
-	for b in $U_BSSIDS; do
-		echo "list r0kh $b,$(r0id_of "$b"),$U_KEY"
-		echo "list r1kh $b,$b,$U_KEY"
+	for t in r0kh r1kh; do
+		for e in $(uci -q get wireless.$1.$t); do
+			case "$e" in
+			ff:ff:ff:ff:ff:ff,\*,*|00:00:00:00:00:00,00:00:00:00:00:00,*) ;;
+			*,"$U_KEY") echo "list $t $e" ;;
+			esac
+		done
 	done
 	echo "list r0kh ff:ff:ff:ff:ff:ff,*,$U_KEY"
 	echo "list r1kh 00:00:00:00:00:00,00:00:00:00:00:00,$U_KEY"
 }
 
-r0id_of() { unifi_records | awk -F'\t' -v s="$SSID" -v b="$1" '$2 == s && $4 == b { print $7; exit }'; }
+is_unifi_bssid() { case " $(echo $U_BSSIDS) " in *" $1 "*) return 0 ;; esac; return 1; }
 
 pick_ssid() {
 	[ -n "$SSID" ] && return
@@ -425,6 +472,37 @@ load_unifi() {
 	U_AKM=$(echo "$recs" | cut -f10 | sort -u)
 	U_PASS=$(echo "$recs" | cut -f11 | sort -u)
 	U_HOSTS=$(echo "$recs" | cut -f1 | sort -u)
+	LOADED=1
+}
+
+has_data() { ls "$DATA"/unifi-*.txt >/dev/null 2>&1; }
+
+# The SSIDs of openUF's enabled 802.11r sections
+ouf_ft_ssids() {
+	for s in $(uci show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		is_openuf "$s" || continue
+		[ "$(uci -q get wireless.$s.ieee80211r)" = 1 ] || continue
+		[ "$(uci -q get wireless.$s.disabled)" = 1 ] && continue
+		uci -q get wireless.$s.ssid
+	done | sort -u
+}
+
+# openUF mode without collected data: the controller's key from openUF's
+# sections (the wildcard r0kh the plugin writes), the mobility domain from the SSID
+load_openuf() {
+	if [ -z "$SSID" ]; then
+		ssids=$(ouf_ft_ssids)
+		[ -n "$ssids" ] || die "no UniFi data; run: rrb-unifi-setup collect USER@UNIFI_IP (with openUF: no openUF WLAN with fast roaming found; turn on Fast Roaming in UniFi)"
+		[ $(echo "$ssids" | wc -l) -eq 1 ] || die "use --ssid NAME (openUF WLANs with fast roaming: $(echo $ssids))"
+		SSID=$ssids
+	fi
+	openuf_mode || die "no UniFi data and '$SSID' is not provisioned by openUF; run: rrb-unifi-setup collect USER@UNIFI_IP"
+	U_MD=$(unifi_md "$SSID")
+	U_KEY=$(for s in $(owrt_sections "$SSID"); do
+		uci -q get wireless.$s.r0kh | tr ' ' '\n' | sed -n 's/^ff:ff:ff:ff:ff:ff,\*,//p'
+	done | sort -u)
+	U_BSSIDS=""; U_HOSTS=""
+	NODATA=1; LOADED=1
 }
 
 check_unifi() {
@@ -433,11 +511,22 @@ check_unifi() {
 	[ $(echo "$U_MD" | wc -l) -eq 1 ] && [ -n "$U_MD" ] && OK "mobility domain $U_MD" || FAIL "UniFi BSSes disagree on the mobility domain: $(echo $U_MD)"
 	[ $(echo "$U_KEY" | wc -l) -eq 1 ] && echo "$U_KEY" | grep -qE '^[0-9a-f]{32}([0-9a-f]{32})?$' \
 		&& OK "FT key $(fp "$U_KEY") (same on all UniFi BSSes)" || FAIL "no single valid FT key in the UniFi r0kh lines"
+	md=$(unifi_md "$SSID")
+	[ "$U_MD" = "$md" ] || WARN "UniFi's mobility domain is not $md, the one derived from the SSID (the openUF plugin writes that one)"
 	[ "$U_FTDS" = 0 ] && OK "UniFi ft_over_ds=0" || FAIL "UniFi uses FT over the DS (ft_over_ds=$U_FTDS); only over-the-air FT is supported"
 	case "$U_AKM" in
 	*FT-SAE*) U_AUTH=sae ;; *FT-PSK*) U_AUTH=psk ;; *) U_AUTH=other ;;
 	esac
 	[ "$U_AUTH" = other ] && FAIL "UniFi key management '$U_AKM' is not FT-PSK/FT-SAE"
+}
+
+check_controller() {	# openUF mode without collected data
+	say "UniFi side: no collected data; the controller's values in openUF's sections, SSID '$SSID':"
+	[ $(echo "$U_KEY" | wc -l) -eq 1 ] && echo "$U_KEY" | grep -qE '^[0-9a-f]{32}([0-9a-f]{32})?$' \
+		&& OK "FT key $(fp "$U_KEY") from the controller (wildcard r0kh, same in all sections)" \
+		|| FAIL "no single valid FT key in the wildcard r0kh of openUF's sections (plugin not active, or no iapp_key from the controller?)"
+	say "  mobility domain: $U_MD (UniFi's derivation from the SSID)"
+	say "  (optional: 'rrb-unifi-setup collect USER@UNIFI_IP' also compares key, mobility domain and password with a UniFi AP)"
 }
 
 check_section() {	# check_section SECTION
@@ -447,13 +536,25 @@ check_section() {	# check_section SECTION
 	if is_openuf "$s"; then
 		say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}, provisioned by openUF):"
 		# apply can't fix these: openUF rewrites the section on every push
-		SFIX() { FAIL "$* (written by openUF: check the openUF plugin below, run 'rrb-unifi-setup peers', then Force Provision)"; }
+		SFIX() { FAIL "$* (written by openUF: check the openUF plugin below, then Force Provision or rename the AP in UniFi)"; }
 	else
 		say "OpenWrt wifi-iface '$s' (${ifn:-not up}, ${bssid:-no BSSID}):"
 		SFIX() { FIX "$@"; }
 	fi
 	[ -n "$bssid" ] || { FAIL "$s: interface not up, can't read its BSSID"; return; }
 
+	if [ "$NODATA" = 1 ]; then
+		say "  (security, password and 802.11w come from the controller: not compared)"
+	else
+		check_security "$s"
+	fi
+
+	desired "$s" "$bssid" > "$DATA/desired.$s"
+	check_keys "$s"
+}
+
+check_security() {	# check_security SECTION: the same security as the UniFi side
+	s=$1
 	enc=$(uci -q get wireless.$s.encryption)
 	case "$enc" in
 	psk2*|psk-mixed*) o_auth=psk ;; sae-mixed*) o_auth=mixed ;; sae*) o_auth=sae ;; *) o_auth=other ;;
@@ -470,8 +571,10 @@ check_section() {	# check_section SECTION
 	if [ "$pmf" = "$U_PMF" ]; then OK "802.11w (PMF) $pmf, same as UniFi"
 	elif [ "$pmf" = 2 ] || [ "$U_PMF" = 2 ]; then FAIL "802.11w: OpenWrt $pmf vs UniFi $U_PMF; a 'required' side blocks roaming clients without PMF"
 	else WARN "802.11w: OpenWrt $pmf vs UniFi $U_PMF"; fi
+}
 
-	desired "$s" "$bssid" > "$DATA/desired.$s"
+check_keys() {	# check_keys SECTION: the options and key holders from desired()
+	s=$1
 	while read -r a b c; do
 		if [ "$a" = list ]; then
 			uci -q get wireless.$s.$b | tr ' ' '\n' | grep -qxF "$c" && OK "$b entry $(echo "$c" | cut -d, -f1-2),$(fp "$U_KEY")" || SFIX "$b entry missing: $(echo "$c" | cut -d, -f1-2),<key>"
@@ -485,6 +588,13 @@ check_section() {	# check_section SECTION
 			grep -qxF "list $t $e" "$DATA/desired.$s" || SFIX "$t entry not matching UniFi, will be removed: $(echo "$e" | cut -d, -f1-2),<key>"
 		done
 	done
+	# explicit entries are an optional pre-seed; one for a BSS UniFi no longer has is only dead weight
+	if [ "$NODATA" != 1 ] && ! is_openuf "$s"; then
+		for e in $(sed -n 's/^list r0kh //p' "$DATA/desired.$s"); do
+			b=${e%%,*}; [ "$b" = ff:ff:ff:ff:ff:ff ] && continue
+			is_unifi_bssid "$b" || WARN "r0kh entry for $b: not a UniFi BSS of '$SSID' (harmless; 'apply' keeps it, remove it by hand if that AP is gone)"
+		done
+	fi
 	opts=$(uci -q get wireless.$s.hostapd_bss_options)
 	echo "$opts" | tr ' ' '\n' | grep -qxF "ft_iface=$(ft_if)" && OK "hostapd_bss_options ft_iface=$(ft_if)" || SFIX "hostapd_bss_options: add ft_iface=$(ft_if)"
 }
@@ -531,12 +641,19 @@ check_running() {	# after config is applied: running hostapd + translator
 	done
 }
 
-check_peers() {	# openUF mode: rrb-unifi's ft_peer list = the UniFi BSSes
-	say "openUF peer list (/etc/config/rrb-unifi ft_peer):"
-	have=$(uci -q get rrb-unifi.main.ft_peer | tr ' ' '\n' | sed '/^$/d' | sort)
-	want=$(desired_peers | sort)
-	if [ "$have" = "$want" ]; then OK "ft_peer: $(echo $want)"
-	else FIX "ft_peer: $(echo ${have:-<none>}) -> $(echo $want)"; fi
+check_peers() {	# openUF mode: the optional ft_peer pre-seed in /etc/config/rrb-unifi
+	say "openUF plugin pre-seed (/etc/config/rrb-unifi ft_peer, optional):"
+	have=$(uci -q get rrb-unifi.main.ft_peer | tr ' ' '\n' | sed '/^$/d')
+	if [ -z "$have" ]; then
+		OK "no ft_peer list: hostapd learns the UniFi peers (the normal case)"
+		return
+	fi
+	OK "ft_peer: $(echo $have) (explicit key holders before the wildcards; not needed)"
+	[ "$NODATA" = 1 ] && return
+	for p in $have; do
+		b=${p%%,*}
+		is_unifi_bssid "$b" || WARN "ft_peer $b: not a UniFi BSS of '$SSID' (harmless; delete it if that AP is gone)"
+	done
 }
 
 check_plugin() {	# openUF mode: the plugin that writes the FT options
@@ -571,8 +688,11 @@ check_plugin() {	# openUF mode: the plugin that writes the FT options
 }
 
 cmd_verify() {
-	[ -n "$U_KEY" ] || load_unifi
-	check_unifi
+	if [ "$LOADED" != 1 ]; then
+		if has_data; then load_unifi; else load_openuf; fi
+	fi
+	mkdir -p "$DATA" && chmod 700 "$DATA"
+	if [ "$NODATA" = 1 ]; then check_controller; else check_unifi; fi
 	for s in $(owrt_sections "$SSID"); do check_section "$s"; done
 	[ -n "$(owrt_sections "$SSID")" ] || FAIL "no enabled OpenWrt AP interface with SSID '$SSID'"
 	openuf_mode && { check_plugin; check_peers; }
@@ -582,7 +702,7 @@ cmd_verify() {
 	say "Result: $ok OK, $fix to fix, $fail failed"
 	[ $fail -gt 0 ] && { say "Fix the FAIL items first (they are not changed automatically)."; return 2; }
 	if [ $fix -gt 0 ]; then
-		openuf_mode && say "Run: rrb-unifi-setup peers" || say "Run: rrb-unifi-setup apply"
+		openuf_mode && say "Run: rrb-unifi-setup install" || say "Run: rrb-unifi-setup apply"
 		return 1
 	fi
 	say "Everything matches."
@@ -593,7 +713,7 @@ cmd_verify() {
 
 cmd_apply() {
 	load_unifi
-	openuf_mode && die "the '$SSID' sections are provisioned by openUF and rewritten on every push; use: rrb-unifi-setup peers"
+	openuf_mode && die "the '$SSID' sections are provisioned by openUF and rewritten on every push; the openUF plugin writes the FT settings ('rrb-unifi-setup verify' checks them)"
 	cmd_verify >"$DATA/verify.out" 2>&1; rc=$?
 	if [ $rc -eq 2 ]; then cat "$DATA/verify.out"; die "verify reports FAIL items; nothing changed"; fi
 	if [ $fix -eq 0 ] && [ $rc -eq 0 ]; then cat "$DATA/verify.out"; say "Nothing to do."; return 0; fi
@@ -639,27 +759,17 @@ cmd_apply() {
 	cmd_verify
 }
 
-# ---------------------------------------------------------------- peers (openUF)
+# ---------------------------------------------------------------- peers (gone in 1.5)
 
-# openUF writes the FT settings from the controller's push; the one thing it
-# can't know is which BSSes the UniFi APs have. Write them from the collected
-# UniFi data. Takes effect on openUF's next config push (Force Provision).
+# 1.4 wrote the UniFi BSSes into rrb-unifi's ft_peer list for openUF. hostapd
+# learns them through the wildcard key holders, so the command only explains.
 cmd_peers() {
-	load_unifi
-	check_unifi >/dev/null
-	[ $fail -eq 0 ] || { check_unifi; die "UniFi data is not usable; nothing changed"; }
-	want=$(desired_peers)
-	have=$(uci -q get rrb-unifi.main.ft_peer | tr ' ' '\n' | sed '/^$/d')
-	if [ "$(echo "$have" | sort)" = "$(echo "$want" | sort)" ]; then
-		say "ft_peer already matches: $(echo $want)"; return 0
+	say "'peers' is no longer needed (1.5): hostapd learns the UniFi peers through the wildcard key holders."
+	if [ -n "$(uci -q get rrb-unifi.main.ft_peer)" ]; then
+		say "The ft_peer list in /etc/config/rrb-unifi still works as an optional pre-seed. To drop it:"
+		say "  uci delete rrb-unifi.main.ft_peer; uci commit rrb-unifi"
+		say "then Force Provision the AP in UniFi (or rename it)."
 	fi
-	say "ft_peer: $(echo ${have:-<none>})"
-	say "     -> $(echo $want)"
-	ask "Write this peer list to /etc/config/rrb-unifi?" || die "cancelled, nothing changed"
-	uci -q delete rrb-unifi.main.ft_peer
-	for p in $want; do uci add_list rrb-unifi.main.ft_peer="$p"; done
-	uci commit rrb-unifi
-	say "Written. openUF uses it on its next config push: Force Provision the AP in UniFi."
 }
 
 # ---------------------------------------------------------------- uninstall
@@ -733,5 +843,5 @@ apply) cmd_apply ;;
 peers) cmd_peers ;;
 uninstall) cmd_uninstall ;;
 confirm) touch "$CONFIRM" && say "Network change confirmed." ;;
-*) sed -n '2,/^$/s/^# \{0,1\}//p' "$SELF" | sed -n '4,26p'; exit 1 ;;
+*) sed -n '2,/^$/s/^# \{0,1\}//p' "$SELF" | sed -n '4,$p'; exit 1 ;;
 esac
