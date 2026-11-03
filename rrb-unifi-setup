@@ -28,7 +28,7 @@
 # (/tmp/rrb-unifi-setup, mode 600). Only a SHA-256 of the Wi-Fi password is
 # read from the UniFi AP, never the password itself. Keys are never printed.
 
-VERSION=1.5
+VERSION=1.5.1
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SRC_DIR=$(dirname "$SELF")
 # openUF's code and conf.lua: /opt/openuf (install.sh), or /usr/lib/openuf (the
@@ -138,6 +138,8 @@ ouf_old_module() { [ -f "$OUF/ftinterop.lua" ] && grep -qE '^[[:space:]]*unifi_f
 plugin_listed() { sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$OUF_ENABLED" 2>/dev/null | grep -qxF rrb-unifi; }
 # conf.lua's own list: the user's file, only read here
 plugin_in_conf() { grep -qE "^[[:space:]]*plugins[[:space:]]*=.*[\"']rrb-unifi[\"']" "$OUF/conf.lua" 2>/dev/null; }
+# The UCI form of that list (the openuf package: list plugin in /etc/config/openuf), only read here
+plugin_in_uci() { uci -q get openuf.main.plugin 2>/dev/null | tr ' ' '\n' | grep -qxF rrb-unifi; }
 
 # Copy the plugin into openUF and enable it; openUF restart on a change
 install_plugin() {
@@ -156,7 +158,7 @@ install_plugin() {
 		cp "$PLUGIN_SRC" "$OUF_PLUGIN"
 		say "openUF plugin: $OUF_PLUGIN"; changed=1
 	fi
-	if ! plugin_listed && ! plugin_in_conf; then
+	if ! plugin_listed && ! plugin_in_conf && ! plugin_in_uci; then
 		[ -s "$OUF_ENABLED" ] && [ -n "$(tail -c1 "$OUF_ENABLED")" ] && echo >> "$OUF_ENABLED"
 		echo rrb-unifi >> "$OUF_ENABLED"
 		say "openUF plugin enabled in $OUF_ENABLED"; changed=1
@@ -191,6 +193,7 @@ wait_ouf_clean() {	# wait_ouf_clean SECONDS -> 0 once no openUF section uses the
 # the veth must outlive every hostapd BSS that uses it.
 uninstall_plugin() {
 	plugin_in_conf && die "$OUF/conf.lua lists rrb-unifi in config.plugins: remove it there first (this tool never edits conf.lua)"
+	plugin_in_uci && die "/etc/config/openuf lists rrb-unifi (list plugin): remove it there first (uci del_list openuf.main.plugin=rrb-unifi; uci commit openuf); this tool never edits openUF's config"
 	ouf_old_module && die "openUF's built-in unifi_ft_interop is on: set it to false in $OUF/conf.lua, restart openUF and Force Provision first"
 	if plugin_listed; then
 		say "openUF plugin rrb-unifi is enabled; openUF must drop its options before the translator goes."
@@ -682,6 +685,7 @@ check_plugin() {	# openUF mode: the plugin that writes the FT options
 	fi
 	if plugin_listed; then OK "enabled in $OUF_ENABLED"
 	elif plugin_in_conf; then OK "enabled in $OUF/conf.lua"
+	elif plugin_in_uci; then OK "enabled in /etc/config/openuf"
 	else FAIL "not enabled (run install)"; fi
 	# A plugin that fails is skipped and the WLAN pushed with openUF's own
 	# values; the running hostapd check below shows whether that happened.
@@ -779,7 +783,7 @@ cmd_peers() {
 
 cmd_uninstall() {
 	say "== rrb-unifi-setup: uninstall"
-	if has_openuf && { plugin_listed || plugin_in_conf || ouf_old_module || [ -n "$(ouf_ft_secs)" ]; }; then
+	if has_openuf && { plugin_listed || plugin_in_conf || plugin_in_uci || ouf_old_module || [ -n "$(ouf_ft_secs)" ]; }; then
 		uninstall_plugin
 	fi
 	for s in $(ouf_ft_secs); do
