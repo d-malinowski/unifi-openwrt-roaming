@@ -31,7 +31,11 @@
 VERSION=1.5
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SRC_DIR=$(dirname "$SELF")
-OUF=/opt/openuf				# openUF's code and conf.lua
+# openUF's code and conf.lua: /opt/openuf (install.sh), or /usr/lib/openuf (the
+# openuf OpenWrt package; it also links /opt/openuf there, so the first form is
+# the usual find). The plugin files below are the same either way.
+OUF=/opt/openuf
+[ -f "$OUF/inform.lua" ] || { [ -f /usr/lib/openuf/inform.lua ] && OUF=/usr/lib/openuf; }
 OUF_PLUGIN=/etc/openuf/plugins/rrb-unifi.lua
 OUF_ENABLED=/etc/openuf/plugins.enabled
 PLUGIN_SRC=$SRC_DIR/openuf-plugin/rrb-unifi.lua
