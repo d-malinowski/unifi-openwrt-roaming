@@ -243,6 +243,9 @@ Not tested yet:
 - several OpenWrt APs with the translator
 - with openUF on real hardware: `verify` and `uninstall`, and installing
   the translator after openUF (tested on the VM only, see the table)
+- openUF from the `openuf` OpenWrt package (`/usr/lib/openuf`, plugin list
+  in `/etc/config/openuf`): the 1.5.1 setup tool's support for it is
+  checked against that package's files, not run on it
 
 Reports are welcome.
 
@@ -428,8 +431,10 @@ openUF owns the Wi-Fi sections and rewrites them on every config push, so
 to every push. The controller sends openUF the WLAN's FT key, so nothing has
 to be read from a UniFi AP: no `collect`, no UniFi SSH login.
 
-It needs openUF with the plugin hook (`/opt/openuf/plugins.lua`, api 1,
-openUF commit `8287ecf` or later); no openUF fork. For each WLAN on which
+It needs openUF with the plugin hook (`plugins.lua`, api 1, openUF commit
+`8287ecf` or later); no openUF fork. The setup tool finds openUF under
+`/opt/openuf` (openUF's `install.sh`) or `/usr/lib/openuf` (the `openuf`
+OpenWrt package). For each WLAN on which
 openUF turns 802.11r on, the plugin sets:
 
 - the mobility domain UniFi firmware derives from the SSID (the first two
@@ -459,7 +464,8 @@ The steps:
    [Quick install](#quick-install-with-rrb-unifi-setup-recommended) step 2,
    finds openUF, copies the plugin to `/etc/openuf/plugins/`, adds
    `rrb-unifi` to `/etc/openuf/plugins.enabled` (it never edits openUF's
-   `conf.lua`) and, after asking, restarts openUF. openUF notices the new
+   `conf.lua` or `/etc/config/openuf`; a `rrb-unifi` already listed in either
+   counts as enabled) and, after asking, restarts openUF. openUF notices the new
    plugin and the controller pushes the Wi-Fi settings again within a few
    informs. To push at once, click **Force Provision** for the AP in UniFi
    (where UniFi offers no Force Provision for the AP, renaming it also pushes).
@@ -501,7 +507,9 @@ To uninstall, run `rrb-unifi-setup uninstall`. With openUF it first removes
 `rrb-unifi` from `plugins.enabled`, restarts openUF and waits until openUF's
 next push has taken `ft_iface` out of its sections (if no push comes within
 3 minutes it asks for a Force Provision). Only then does it stop the
-translator and remove the veth, so no hostapd BSS loses its interface.
+translator and remove the veth, so no hostapd BSS loses its interface. If
+`rrb-unifi` is listed in `conf.lua` or in `/etc/config/openuf`
+(`list plugin`), it stops first and names what to remove there.
 
 ### After a firmware upgrade
 
@@ -844,6 +852,17 @@ Then remove the packages if nothing else needs them:
 
 
 ## Changes
+
+### 1.5.1
+
+- Setup tool: finds openUF installed by the `openuf` OpenWrt package under
+  `/usr/lib/openuf` as well, not only under `/opt/openuf` (contributed by
+  yesrab, PR #2). Before, such an install got the translator without the
+  plugin, and `verify` and `uninstall` ran as if there were no openUF.
+- Setup tool: reads that package's plugin list in `/etc/config/openuf`
+  (`list plugin`) too: `install` doesn't add a second entry, `verify`
+  reports it, `uninstall` names what to remove there.
+- The translator and the openUF plugin are unchanged from 1.5.
 
 ### 1.5
 
