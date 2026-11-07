@@ -1,3 +1,5 @@
+![UniFi and OpenWRT connected for seamless roaming](assets/banner.svg)
+
 # unifi-openwrt-roaming
 
 **Extend your UniFi Wi-Fi with any OpenWrt device, including old routers you
