@@ -14,9 +14,11 @@
   <text x="44" y="39">+-- INTEROPERABILITY / OPEN SOURCE</text><text x="1236" y="39" text-anchor="end">[ 802.11r ENABLED ]</text>
 </g>
 <!-- Interlocking loops contain plain text, not graphical brand logos. -->
-<rect x="333" y="83" width="350" height="197" rx="98" fill="#142337" fill-opacity=".65" stroke="#83dfff" stroke-width="4"/>
-<rect x="597" y="83" width="350" height="197" rx="98" fill="#352132" fill-opacity=".5" stroke="#ffcb98" stroke-width="4"/>
-<path d="M683 182C683 236 639 280 585 280" fill="none" stroke="#83dfff" stroke-width="4"/>
+<!-- Paint both translucent fills before either outline to keep loop colours consistent. -->
+<rect x="333" y="83" width="350" height="197" rx="98" fill="#142337" fill-opacity=".65"/>
+<rect x="597" y="83" width="350" height="197" rx="98" fill="#352132" fill-opacity=".5"/>
+<rect x="333" y="83" width="350" height="197" rx="98" fill="none" stroke="#83dfff" stroke-width="4"/>
+<rect x="597" y="83" width="350" height="197" rx="98" fill="none" stroke="#ffcb98" stroke-width="4"/>
 <g font-family="Consolas, 'Liberation Mono', monospace" font-weight="bold" text-anchor="middle">
   <text x="473" y="198" fill="#a1e6ff" font-size="48">UniFi</text>
   <text x="809" y="196" fill="#ffd8b0" font-size="38">OpenWRT</text>
